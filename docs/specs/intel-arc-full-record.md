@@ -187,5 +187,11 @@ parked, that could matter on this hardware:
   -DCMAKE_CXX_COMPILER=icpx -DSTRATA_ENABLE_SYCL=ON -DSTRATA_SYCL_AOT=bmg-g31 && cmake --build build-sycl --target strata`.
 - Fast tier (IQ3_S): `strata-iq3_s-split.json`. Quality tier (Q4_K_M): `strata-swift-q4_k_m-split.json`
   (needs `STRATA_SPLIT_MIRROR=1`, set in the config's env). Both on port 8081.
+- **Hot-swap (llama-swap):** both are registered in `~/.config/llama-swap/config.yaml` as `strata-iq3s` and
+  `strata-q4km` (ids `strata:iq3_s` / `strata:q4_k_m`), launched by the local scripts `run-iq3_s-split.sh` /
+  `run-swift-q4_k_m-split.sh` (gitignored — machine-local). Both use both Arcs, so they sit in no shared set:
+  each runs alone and evicts everything else. llama-swap polls `/health` (503 while the cache fills; the config's
+  `healthCheckTimeout: 900` covers the slow first load). Verified working 2026-10-13: a request to `strata-iq3s`
+  on `:8080` loaded the engine and answered.
 - House rules for any PR off this work: one change per PR, opt-in, default path byte-identical, measured numbers
   with the hardware named, build every backend a file touches.
