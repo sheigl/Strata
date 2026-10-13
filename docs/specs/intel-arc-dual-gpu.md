@@ -292,6 +292,19 @@ The reserve drop (2048→1024 MiB) bought +9% — ~2 GiB that sat idle at load n
 is 300 MiB; 1024 is the conservative working value. The canonical Q4_K_M split config is
 `strata-swift-q4_k_m-split.json` (K24, mirror on, reserve 1024).
 
+**Split sweep with the mirror on (2026-10-13) — balanced K24 is the optimum:**
+
+| K | decode | note |
+|---|---|---|
+| 26 | 30.2 tok/s | drags the weaker B65 |
+| **24** | **32.2 tok/s** | balanced — the winner |
+| 28 | 26.7 tok/s | overloads the B70's cache into the mirror |
+
+Both skews lose. **Balanced 24 + per-stage mirror + reserve 1024 = 32.2 tok/s is the 2-card ceiling for Q4_K_M**
+on this hardware. (Recurring warning at this size: "RAM is tight - 75.0 GB of experts on a 63 GB PC" — the
+19-21 GiB mirror plus the model's footprint is tight against 62 GB RAM; it bounds how aggressive the mirror can
+get and is the thing the idle B580's 12 GB would relieve as a 3rd card.)
+
 **Profiled 2026-10-13 (where Q4_K_M's 29.5 vs IQ3_S's 67 actually goes) — the MMQ port is NOT the first lever:**
 
 - The 29.5 tok/s is **decode**, which uses the already-present K-quant dots — MMQ only speeds the *prompt* path.
