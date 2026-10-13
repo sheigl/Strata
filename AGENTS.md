@@ -26,9 +26,11 @@ offers the same steps as tools.
 
 - **Intel Arc, CUDA-level parity, dual-GPU pooled (B70 + B65):** confirmed intent and handoff doc at
   [docs/intent/intel-arc-dual-gpu.md](docs/intent/intel-arc-dual-gpu.md); spec at
-  [docs/specs/intel-arc-dual-gpu.md](docs/specs/intel-arc-dual-gpu.md). Success gate: pooled pair runs ≥ q4_k_m
-  at ≥ 131,072 context via the one-click Linux setup. Read the intent doc first; it corrects the "Intel support
-  is a stub" premise (the `sycl/` port and community dual-B70 results already exist). **Progress 2026-10-13:
+  [docs/specs/intel-arc-dual-gpu.md](docs/specs/intel-arc-dual-gpu.md). **The complete technical record (what we
+  did, every lever pulled, every lever left, the open Intel optimization space) is
+  [docs/specs/intel-arc-full-record.md](docs/specs/intel-arc-full-record.md) — start there.** Success gate: pooled
+  pair runs ≥ q4_k_m at ≥ 131,072 context via the one-click Linux setup. Read the intent doc first; it corrects
+  the "Intel support is a stub" premise (the `sycl/` port and community dual-B70 results already exist). **Progress 2026-10-13:
   WS0 done** (root cause = stale 0.1.39 binary's post-load crash; rebuilt to 0.1.43.1; B65 `e222` detection fixed;
   native `sycl/serve/strata-sycl-host.sh` recreated) and **WS2 done** (B65+B70 layer-split, 131K context,
   validated at 115,959 tokens read). **WS5 in progress:** Q4_K_M admitted to setup and now **serves on the pair**
