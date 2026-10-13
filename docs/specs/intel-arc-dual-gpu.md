@@ -276,9 +276,41 @@ The two engine bugs the implementation surfaced (both in the agent's per-stage-m
    remaining budget** (first uses what it needs, the rest flows on; misses are hottest-first).
    (`sycl/src/program/generate.cpp`)
 
-Still open for Q4_K_M speed (next levers, in the order the spec's WS3 lists them): the MMQ K-quant **prompt** path
-(the dequant→oneMKL fallback is the prompt bottleneck), and whether a less-extreme skew than 24-plus-mirror reads
-even faster. 29.5 tok/s is below IQ3_S's 67 — the gap is the K-quant prompt path + the mirror's PCIe reads.
+Still open for Q4_K_M speed: the MMQ K-quant **prompt** path (the dequant→oneMKL fallback is the prompt
+bottleneck), and the idle B580 (bmg-g21) as a 3rd card (a separate, unscoped project). The headline decode gap to
+IQ3_S is PCIe mirror drag (below).
+
+**Tuning progression (2026-10-13, all on the pair, Q4_K_M, 131K):**
+
+| config | decode | note |
+|---|---|---|
+| skew K32, no mirror | 18.8 tok/s | B65 strands 7,472 experts on PCIe |
+| balanced K24 + mirror | 29.5 tok/s | per-stage mirror serves the overflow |
+| **K24 + mirror + `--vram-reserve-mib 1024`** | **32.2 tok/s** | mirror 21.3→19.3 GiB; ~640 more experts on-card |
+
+The reserve drop (2048→1024 MiB) bought +9% — ~2 GiB that sat idle at load now holds experts. Floor per INTEL.md
+is 300 MiB; 1024 is the conservative working value. The canonical Q4_K_M split config is
+`strata-swift-q4_k_m-split.json` (K24, mirror on, reserve 1024).
+
+**Profiled 2026-10-13 (where Q4_K_M's 29.5 vs IQ3_S's 67 actually goes) — the MMQ port is NOT the first lever:**
+
+- The 29.5 tok/s is **decode**, which uses the already-present K-quant dots — MMQ only speeds the *prompt* path.
+  So porting MMQ would not move the headline decode number.
+- The decode gap is dominated by the **PCIe mirror**: Q4_K_M (62 GB) leaves ~6,900 experts (21.26 GiB) in the
+  pinned host mirror, read over PCIe at 12-14 GB/s per verify round; IQ3_S (50 GB) leaves ~0 (fits VRAM). At
+  6 tokens/round × ~6,900 candidates, the mirrored reads are the drag.
+- **Levers that would actually lift Q4_K_M decode, in order:**
+  1. **More VRAM residency / less mirror:** a capacity-aware split + the `STRATA_STAGE_TRIM` + trimming the head
+     card's non-expert load (the session KV) so more of the 6,900 fit in VRAM. Also: a *third* card (the idle
+     B580, 12 GB) as a mirror-tier helper — but the B580 is a different AOT arch (bmg-g21), so a 3-way split is
+     its own project.
+  2. **Faster PCIe reads** (batching/coalescing the mirrored-expert DMA): the port's stager reads them one blob
+     at a time; a grouped read would cut the per-round cost.
+  3. **The MMQ prompt path** (the original WS5-fast idea) — speeds prompt ingest, not decode; do it only if
+     prompt speed matters for the use case.
+- **Honest ceiling note:** Q4_K_M is simply bigger than the pair's fast tier. IQ3_S (the tier the docs rate
+  "matches the full model") fits VRAM and hits 67; Q4_K_M trades ~2.3x decode for the marginal quality of 4-bit
+  over 3.5-bit — which is exactly the quality-vs-speed call the user flagged with the Reddit question.
 
 ## Explicit non-goals
 
