@@ -122,6 +122,7 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
     uint64_t total = 0;
     for (const auto& [l, e] : pairs) {
         if (l < 0 || l >= n_layers_ || e < 0 || e >= n_expert_) continue;
+        if (pinned(l, e)) continue;   // STRATA_SPLIT_MIRROR: an earlier stage already mirrored this one
         const uint64_t b = (lay.bytes[(size_t) l] + 255) / 256 * 256;
         if (total + b > cap) break;
         take.push_back({l, e});
@@ -187,12 +188,16 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
         err = "mirror: reading an expert from the GGUF failed";
         return -1;
     }
-    for (uint8_t* c : mirror_chunks_) if (c) sycl::free(c, dpct::get_in_order_queue());
-    mirror_chunks_ = std::move(chunks);
+    // STRATA_SPLIT_MIRROR (a call per split stage): append to the mirror instead of rebuilding it - the chunks and
+    // the pointer table of the earlier stages' calls stay live, and this call's chunks join them.  A single-stage
+    // (non-split) caller makes exactly one call, so its behavior is unchanged (the old pointers are empty then).
+    for (uint8_t* c : chunks) mirror_chunks_.push_back(c);
     cleanup.armed = false;                                  // the chunks now belong to the object
-    mirror_bytes_ = total;
-    mirror_ptr_.assign((size_t) (n_layers_ * n_expert_), nullptr);
-    layer_first_.assign((size_t) n_layers_, nullptr);
+    mirror_bytes_ += total;                                 // append: this call's bytes on top of earlier calls'
+    if (mirror_ptr_.empty()) {
+        mirror_ptr_.assign((size_t) (n_layers_ * n_expert_), nullptr);
+        layer_first_.assign((size_t) n_layers_, nullptr);
+    }
     for (size_t j = 0; j < take.size(); ++j) {
         const auto [l, e] = take[j];
         mirror_ptr_[(size_t) (l * n_expert_ + e)] = ptrs[j];

@@ -4805,7 +4805,12 @@ int main(int argc, char **argv) try {
     // the GPU takes is --pcie-frac; STRATA_MIRROR_MIB caps the mirror (default: MemAvailable less 4 GiB), 0 = off.
     unsigned long long* mirror_table_d = nullptr;   // [n_layers][n_expert] device-readable mirror addresses (0 = none)
     int64_t unmirrored_misses = 0;
-    if (o.stream_experts && srcp == &gguf_src && o.expert_cache > 0) {
+    // STRATA_SPLIT_MIRROR (opt-in, default off): on a multi-GPU layer split, defer the mirror build to after the
+    // stage caches exist and give EVERY stage its own mirror (below, after the stage loop) instead of the
+    // first-stage-only mirror here.  Off (or single-GPU): this block runs exactly as it always has.
+    const bool split_mirror = [] { const char* v = std::getenv("STRATA_SPLIT_MIRROR"); return v && *v && std::strcmp(v, "0") != 0; }();
+    const bool defer_mirror = split_mirror && multi_gpu;
+    if (o.stream_experts && srcp == &gguf_src && o.expert_cache > 0 && !defer_mirror) {
         // #1054, #1440: with a layer split the mirror holds only the first GPU's layers. The pinned memory belongs to
         // this GPU's context, and the later stages' caches do not exist yet (every later-stage expert would count as a
         // miss: 20 GiB of RAM for experts the other card then holds, or one 39 GiB pinned allocation that fails).
@@ -4967,7 +4972,103 @@ int main(int argc, char **argv) try {
     }
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
-    // #1980: the host mirror and the "REFUSED" count above cover the first stage only. A later stage whose cache does not
+    // STRATA_SPLIT_MIRROR (opt-in): every stage's misses mirrored, each stage's table on its own device.  Built here,
+    // after every stage's cache exists, so a layer's miss is counted against the cache of the stage that runs it
+    // (#1054's reason for the first-stage-only mirror no longer applies: the caches all exist now).  One pinned pool
+    // in gguf_src holds all stages' mirrored blobs (host USM is readable by every card - sycl/probe/mirror_xcard.cpp,
+    // 0 errors on the B70+B65 pair); each stage's table is a device-side array of the pool's addresses.
+    std::vector<unsigned long long*> stage_mirror;   // [n_stages]: stage i's table on its device (index 0 = CUDA0), null = none
+    int64_t split_mirror_unmirrored = 0;             // misses no stage's mirror share covered (the REFUSED count below)
+    if (defer_mirror && o.stream_experts && srcp == &gguf_src && o.expert_cache > 0) {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        const int n_stages_m = (int) split_at.size() + 1;
+        // each stage's layer range: stage 0 = [0, split_at[0]) on this card, stage i>0 = stages[i-1]->lb..le
+        auto stage_lb = [&](int s) { return s == 0 ? (int64_t) 0 : stages[(size_t) s - 1]->lb; };
+        auto stage_le = [&](int s) { return s == 0 ? split_at[0] : stages[(size_t) s - 1]->le; };
+        auto stage_slot_of = [&](int s, int64_t l, int64_t e) {
+            return s == 0 ? xcache.slot_of(l, e) : stages[(size_t) s - 1]->cache.slot_of(l, e);
+        };
+        // per stage: its misses (profile order first - hottest - then the unprofiled rest), and their bytes
+        std::vector<std::vector<std::pair<int64_t, int64_t>>> smiss((size_t) n_stages_m);
+        std::vector<uint64_t> sbytes((size_t) n_stages_m, 0);
+        for (int s = 0; s < n_stages_m; ++s) {
+            const int64_t lb = stage_lb(s), le = stage_le(s);
+            for (const auto& pr : profile)
+                if (pr.first >= lb && pr.first < le && stage_slot_of(s, pr.first, pr.second) == strata::core::kNotResident)
+                    smiss[(size_t) s].push_back({pr.first, pr.second});
+            for (int64_t l = lb; l < le; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (stage_slot_of(s, l, e) == strata::core::kNotResident &&
+                        std::find(smiss[(size_t) s].begin(), smiss[(size_t) s].end(), std::pair<int64_t, int64_t>{l, e}) == smiss[(size_t) s].end())
+                        smiss[(size_t) s].push_back({l, e});
+            for (const auto& pr : smiss[(size_t) s]) sbytes[(size_t) s] += (uint64_t) lay.blob_bytes(pr.first);
+        }
+        // the RAM cap, split across the stages in proportion to their miss bytes (the first stage no longer eats it all)
+        uint64_t avail = 0;
+        if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+            char key[64]; unsigned long long kb = 0;
+            while (std::fscanf(f, "%63s %llu kB", key, &kb) == 2)
+                if (std::strcmp(key, "MemAvailable:") == 0) { avail = kb << 10; break; }
+            std::fclose(f);
+        }
+        const char* mv = std::getenv("STRATA_MIRROR_MIB");
+        const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        uint64_t total_miss = 0;
+        for (int s = 0; s < n_stages_m; ++s) total_miss += sbytes[(size_t) s];
+        if (cap > 0 && total_miss > 0) {
+            const auto tm = Clock::now();
+            uint64_t spent = 0;   // budget handed out so far (a stage that needed less passes the rest on)
+            for (int s = 0; s < n_stages_m; ++s) {
+                if (smiss[(size_t) s].empty()) continue;
+                // Each stage offers its full miss list against the REMAINING budget (misses are hottest-first, and
+                // mirror() stops at the budget), so a stage with a small overflow uses only what it needs and the
+                // rest flows on.  A proportional share (cap*sbytes/total) stranded bytes: the later stage, whose
+                // overflow is the big one, was capped short of it (#WS5).
+                const uint64_t share = cap - spent;
+                const uint64_t before = gguf_src.mirrored_bytes();
+                const int64_t got = gguf_src.mirror(smiss[(size_t) s], share, 8, err);
+                spent += gguf_src.mirrored_bytes() - before;   // what it actually pinned, not the offer
+                if (got < 0) {
+                    std::fprintf(stderr, "strata generate: STRATA_SPLIT_MIRROR: stage %d: mirroring the experts missing from VRAM: %s "
+                                         "(they stay on the SSD)\n", s, err.c_str());
+                    err.clear();
+                }
+            }
+            std::fprintf(stderr, "strata generate: STRATA_SPLIT_MIRROR: the split stages' misses mirrored in pinned host memory "
+                                 "(%.2f GiB, %.1f s); each card reads its own table over PCIe\n",
+                         (double) gguf_src.mirrored_bytes() / 1073741824.0,
+                         std::chrono::duration<double>(Clock::now() - tm).count());
+            // one table per stage on that stage's device: the full [n_layers][n_expert] grid, only its layers' pinned
+            // entries non-zero (196 KB each; the verify plan indexes it by global layer against that stage's d_res)
+            stage_mirror.assign((size_t) n_stages_m, nullptr);
+            for (int s = 0; s < n_stages_m; ++s) {
+                std::vector<unsigned long long> tab((size_t) (g.n_layers * g.n_expert), 0ull);
+                for (const auto& pr : smiss[(size_t) s])
+                    if (gguf_src.pinned(pr.first, pr.second))
+                        tab[(size_t) (pr.first * g.n_expert + pr.second)] = (unsigned long long) gguf_src.device_alias(pr.first, pr.second);
+                if (std::all_of(tab.begin(), tab.end(), [](unsigned long long a) { return a == 0; })) continue;
+                const strata::core::OnDevice on(s == 0 ? 0 : stages[(size_t) s - 1]->dev);
+                stage_mirror[(size_t) s] = sycl::malloc_device<unsigned long long>(tab.size(), dpct::get_in_order_queue());
+                if (stage_mirror[(size_t) s] == nullptr) {
+                    std::fprintf(stderr, "strata generate: STRATA_SPLIT_MIRROR: stage %d: the mirror table allocation failed\n", s);
+                    continue;
+                }
+                dpct::get_in_order_queue().memcpy(stage_mirror[(size_t) s], tab.data(), tab.size() * sizeof(unsigned long long)).wait();
+            }
+            mirror_table_d = stage_mirror[0];   // stage 0's table, where the single table's users expect it
+        }
+        // the safety net, now over every stage: a miss its stage's mirror share did not cover
+        for (int s = 0; s < n_stages_m; ++s)
+            for (const auto& pr : smiss[(size_t) s])
+                if (!gguf_src.pinned(pr.first, pr.second)) ++split_mirror_unmirrored;
+        if (split_mirror_unmirrored > 0)
+            std::fprintf(stderr, "strata generate: STRATA_SPLIT_MIRROR: %lld experts over all stages are neither in VRAM nor mirrored "
+                                 "(raise STRATA_MIRROR_MIB or the free RAM)\n", (long long) split_mirror_unmirrored);
+    }
+    // STRATA_SPLIT_MIRROR asked for but no mirror could be built (streaming or the GGUF source off): the split-stage
+    // overflow count below is the honest safety net, so count it the legacy way.
+    const bool split_mirror_ran = defer_mirror && o.stream_experts && srcp == &gguf_src && o.expert_cache > 0;
+    // #1980: without STRATA_SPLIT_MIRROR the host mirror covers the first stage only. A later stage whose cache does not
     // hold all of its layers' experts has no mirror entry for the rest, and with STRATA_VERIFY_NO_HOST no host answers for
     // them: the device plan reads a bad address and the card is lost at the first verify window (2x Arc Pro B60, xe CAT
     // fault). Refuse at the start with the same message, and say how to get a complete load.
@@ -4978,15 +5079,25 @@ int main(int argc, char **argv) try {
             const GpuStage& st = *stp;
             later_misses += std::max<int64_t>(0, (st.le - st.lb) * g.n_expert - (int64_t) st.cache.slots());
         }
-        if (later_misses > 0 && no_host_split) {
+        // STRATA_SPLIT_MIRROR: the mirror above covers the later stages too; refuse only on what it could not pin
+        // (counted over every stage), not on VRAM misses the mirror now serves.
+        if (defer_mirror && split_mirror_unmirrored > 0 && no_host_split) {
+            std::fprintf(stderr, "strata generate: REFUSED: %lld experts over all layer-split stages are neither in VRAM nor mirrored "
+                                 "(STRATA_SPLIT_MIRROR is on; the RAM cap is too small for every stage's overflow); with "
+                                 "STRATA_VERIFY_NO_HOST the device plan cannot run them - raise STRATA_MIRROR_MIB or the free RAM, "
+                                 "lower --max-context, or unset STRATA_VERIFY_NO_HOST\n", (long long) split_mirror_unmirrored);
+            return 2;
+        }
+        if (!defer_mirror && later_misses > 0 && no_host_split) {
             std::fprintf(stderr, "strata generate: REFUSED: %lld experts of the later layer-split stages are neither in VRAM nor mirrored "
                                  "(the host mirror covers the first stage only); with STRATA_VERIFY_NO_HOST the device plan cannot run them "
-                                 "and the card is lost at the first verify window - set STRATA_STAGE_TRIM=1 (with --layer-split N) to free "
+                                 "and the card is lost at the first verify window - set STRATA_SPLIT_MIRROR=1 to mirror every stage, "
+                                 "STRATA_STAGE_TRIM=1 (with --layer-split N) to free "
                                  "each card's duplicate dense weights, lower --max-context or --vram-reserve-mib, or unset "
                                  "STRATA_VERIFY_NO_HOST\n", (long long) later_misses);
             return 2;
         }
-        if (later_misses > 0)
+        if (later_misses > 0 && !defer_mirror)
             std::fprintf(stderr, "strata generate: layer split: %lld experts of the later stages are not in VRAM (served by the host)\n",
                          (long long) later_misses);
     }
@@ -7017,6 +7128,7 @@ int main(int argc, char **argv) try {
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d);
+        if (defer_mirror && !stage_mirror.empty()) vh.mirror_table = stage_mirror[0];   // per-verifier, not the global
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -7115,6 +7227,7 @@ int main(int argc, char **argv) try {
                     const strata::core::OnDevice on(gs.dev);
                     strata::core::VerifyHits vs;
                     vs.d_res = gs.d_res;
+                    vs.mirror_table = defer_mirror && (size_t) st < stage_mirror.size() ? stage_mirror[(size_t) st] : nullptr;
                     vs.h_res = host_res.empty() ? nullptr : host_res.data();
                     vs.cache_base = gs.cache.device_slot(0);
                     vs.blob = thits.blob;
@@ -7169,6 +7282,7 @@ int main(int argc, char **argv) try {
                 const strata::core::OnDevice on(gs.dev);
                 strata::core::VerifyHits vs;
                 vs.d_res = gs.d_res;
+                vs.mirror_table = defer_mirror && stage_mirror.size() > 1 ? stage_mirror[1] : nullptr;   // this card's own
                 vs.h_res = host_res.empty() ? nullptr : host_res.data();
                 vs.cache_base = gs.cache.device_slot(0);
                 vs.blob = thits.blob;
@@ -12122,6 +12236,7 @@ int main(int argc, char **argv) try {
             dpct::get_in_order_queue().memset(usage_dev, 0, (size_t) (g.n_layers * g.n_expert) * 4).wait();
         }
         if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d, usage_dev);
+        if (defer_mirror && !stage_mirror.empty()) vh.mirror_table = stage_mirror[0];   // per-verifier, not the global
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;

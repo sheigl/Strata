@@ -246,6 +246,40 @@ mirror, and (b) the prompt path is the un-ported dequant→oneMKL fallback (no S
 (Fix 1) is what would let a balanced-ish split serve Q4_K_M without the extreme skew** — and the MMQ prompt port
 (WS5 fast path) is what would lift the prompt speed. Both remain the open WS5 work; Fix 2 proves the model fits.
 
+**Split-sweep curve (2026-10-13, all on the pair, 131K, Q4_K_M) — proves the per-stage mirror is necessary:**
+
+| K | B65 (first stage) | B70 (head) stage | outcome |
+|---|---|---|---|
+| 17 | layers 0-16, **0 mirrored** (8,704/8,704 in VRAM) | 17-47: 15,872 pairs vs 8,425 cache | **REFUSED** (7,447 unhomed) |
+| 24 | layers 0-23, ~2,000 mirrored | 24-47: 12,288 vs 8,602 | **REFUSED** (3,686) |
+| 32 | layers 0-31, **7,472 over PCIe** (22.5 GiB) | 32-47: 8,192 vs 8,192 ✅ | **serves, 18.8 tok/s** |
+
+There is no split that is both fast and fits: low K removes the B65's PCIe drag but overflows the B70; high K fits
+the B70 but strands the B65 on slow PCIe. The per-stage mirror (Fix 1) breaks this by making the B70's overflow
+servable, so a mid skew (K~24-28) could serve Q4_K_M fast. **Fix 1 is confirmed necessary, not optional.**
+
+**Fix 1 RESULT (2026-10-13, the per-stage mirror works):** `STRATA_SPLIT_MIRROR=1` + the two engine fixes below
+make Q4_K_M **serve on the BALANCED split 24** — the config that REFUSED twice before. Both stages' overflow now
+mirrored (21.26 GiB in pinned host memory), `session is up`, 131K context, correct output.
+
+**Decode 18.8 → 29.5 tok/s (+57%)**, prompt (cached) 33 → 52 tok/s, draft acceptance ~79%. Q4_K_M went from
+"won't load" → "serves but slow" (skew) → "serves at a usable clip" (balanced + mirror).
+
+The two engine bugs the implementation surfaced (both in the agent's per-stage-mirror wiring, found by testing):
+
+1. **`GgufExpertSource::mirror` reset the mirror on every call** (freed the prior chunks, rebuilt the pointer
+   table) — so the per-stage loop kept only the LAST stage's mirror (~11.34 GiB regardless of the RAM cap).
+   Fixed to **append** (chunks accumulate, `mirror_bytes_ +=`, skip already-pinned experts).
+   (`sycl/src/core/gguf_expert_source.cpp`)
+2. **The RAM cap was split proportionally by miss bytes**, which stranded budget on the first stage's small
+   overflow and capped the big later-stage overflow short. Fixed to **offer each stage's miss list against the
+   remaining budget** (first uses what it needs, the rest flows on; misses are hottest-first).
+   (`sycl/src/program/generate.cpp`)
+
+Still open for Q4_K_M speed (next levers, in the order the spec's WS3 lists them): the MMQ K-quant **prompt** path
+(the dequant→oneMKL fallback is the prompt bottleneck), and whether a less-extreme skew than 24-plus-mirror reads
+even faster. 29.5 tok/s is below IQ3_S's 67 — the gap is the K-quant prompt path + the mirror's PCIe reads.
+
 ## Explicit non-goals
 
 - Windows / WSL2 support (INTEL_ARC.md's Windows section stays accurate).
