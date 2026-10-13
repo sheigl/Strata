@@ -227,6 +227,25 @@ works; K-quant *capacity planning on a split* is the open work.
 - **Recommendation:** Fix 1 is the durable answer and the upstreamable one; Fix 2 is a same-day experiment to
   confirm the pair *can* hold Q4_K_M at all. Effort on Fix 1 is days of careful verify-path work, not weeks.
 
+**Fix 2 RESULT (2026-10-13, measured on the pair): the skewed split WORKS — Q4_K_M serves.** At
+`--layer-split 32` (B65 = layers 0-31, B70 = 32-47 + head/MTP): the B70's 8,192 profiled pairs **all fit its
+cache (8192/8192)**, no REFUSED, `session is up`, 131K context, correct output. The B65 carries 32 layers with
+7,472 experts served over PCIe from the mirror (22.5 GiB).
+
+**But the speed cost is large** — warmed, 3x 256-token runs, Q4_K_M split-32 vs IQ3_S split-24:
+
+| | IQ3_S (split 24) | Q4_K_M (split 32) |
+|---|---|---|
+| decode | **67 tok/s** | **18.8 tok/s** (~3.5x slower) |
+| prompt (cached) | 93 tok/s | 33 tok/s |
+| draft acceptance | 80% | ~79% |
+
+So Q4_K_M is **correct and serving** (the headline gate's "runs correctly at a stated tok/s, 131K context" is
+technically met at 18.8 tok/s) but slow, because (a) the skew strands much of the model on the weaker B65 +
+mirror, and (b) the prompt path is the un-ported dequant→oneMKL fallback (no SYCL MMQ). **The per-stage mirror
+(Fix 1) is what would let a balanced-ish split serve Q4_K_M without the extreme skew** — and the MMQ prompt port
+(WS5 fast path) is what would lift the prompt speed. Both remain the open WS5 work; Fix 2 proves the model fits.
+
 ## Explicit non-goals
 
 - Windows / WSL2 support (INTEL_ARC.md's Windows section stays accurate).
