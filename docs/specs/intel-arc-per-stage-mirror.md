@@ -76,8 +76,11 @@ Key facts that make it tractable:
 ### Risks / what to verify on-card
 
 - **Whether a later stage's GPU can dereference a host pointer allocated under the first stage's pinned
-  allocation.** The design assumes host-pinned memory is readable by any card (true for SYCL host USM on xe).
-  Verify with a 2-card smoke test before the full build.
+  allocation.** ~~The design assumes host-pinned memory is readable by any card (true for SYCL host USM on xe).
+  Verify with a 2-card smoke test before the full build.~~ **CONFIRMED 2026-10-13:** `sycl/probe/mirror_xcard.cpp`
+  (host USM allocated on the B65's queue, read by a kernel on the B70, 4 MB) → `0/1048576 wrong`,
+  "cross-card host-mirror read WORKS". The design's central assumption holds on this machine (bmg-g31, oneAPI
+  2026.1.1, xe).
 - **Thread-safety** if `resident_plan_set_mirror` stays global and stages verify concurrently — the strongest
   argument for the per-verifier (b) shape.
 - **PCIe bandwidth** when both cards stream mirrored misses at once (each on its own link; the docs' probes were
