@@ -143,6 +143,68 @@ are CUDA-only (`UD-Q4_K_XL` is `nvidia_only`). Scope: bring K-quant expert/promp
 admit Swift-1.5 Q4_K_M in setup. This is real engine work, sequenced **after** WS0-WS2 prove the base port on the
 pair; sizing it honestly is part of this workstream, not a promise made here. Acceptance: gate 3.
 
+**Scoped 2026-10-13 (static, against the source).** ~~Smaller than feared~~ **Revised after a deep code read
+(subagent, evidence file:line): the premise "add the three MMQ cases" was stale.** Findings:
+
+- **The SYCL build does not compile `moe_mmq.dp.cpp` AT ALL** — for *any* quant. `sycl/CMakeLists.txt` builds the
+  prompt path from `gemm.cu/kernels.cu/prefill.cpp` + `moe_fused_stub.cpp` + `xmx_moe.dp.cpp`; it never lists the
+  MMQ TUs, and `STRATA_PREFILL_MMQ` is never defined, so `prefill.cpp` compiles the **stub** (`mmq::built()`→false).
+  The on-disk `sycl/src/prefill/moe_mmq.dp.cpp` is dead code (`migrate.sh` skips it). No MMQ of any kind runs on
+  SYCL today; the i-quants work via a *separate* XMX grouped-GEMM + dequant→oneMKL path.
+- **Q4_K_M runs CORRECTLY today** (if admitted past setup) via the fallback: prompt path `mmq_plan` sees
+  `built()==false` → `fallback=true` → dequant-to-FP16 + oneMKL GEMM; decode uses the existing K-quant VMMQ dots
+  (`vec_dot_q4_K_q8_1`), which pass the `is_iq()` gate (Q4_K/Q5_K included unconditionally). No hard error for
+  Q4_K_M. The **only** refusal is at setup (`SUPPORTED_GGUFS` / `gguf_unsupported`), before the engine.
+
+**So WS5 splits into "make it work" (small) vs "make it fast" (large):**
+
+1. **Make Q4_K_M work (small, correctness):** admit Q4_K_M in `setup.py` (`MODELS` + `SUPPORTED_GGUFS`, keyed to
+   the sycl backend, not `nvidia_only`). The engine already runs it correctly via the dequant+decode-dots
+   fallback. Verify with a real load + a served prompt on the pair. **This alone may satisfy gate 3** — the gate
+   says "runs correctly at a stated decode tok/s," not "fast."
+2. **Make Q4_K_M fast (large, opt-in):** wire the whole MMQ library into the SYCL build (`strata_mmq` target,
+   `-DSTRATA_PREFILL_MMQ` + `-DSTRATA_MMQ_KQUANTS`, the per-type instantiation files, the quantizer, host-symbol
+   shim), then add the K-quant cases to `moe_mmq.dp.cpp`'s `supported()`/`run()`. The pinned llama.cpp MMQ has a
+   **DP4A (non-tensor-core) route** that Arc can run (`use_mma_data_layout()` is false on Intel), so no mma.sync
+   port is needed. Risk to watch: `ggml_cuda_info().cc` on Arc is a SYCL version, so the MMQ config selector must
+   land on a valid DP4A tile config (else `J_best=0` abort). **Opt-in per house rules** — it would also speed up
+   Q2_0/i-quants, so it must not change the default path.
+
+**Decision point for the user:** try "make it work" (step 1) first and measure the actual Q4_K_M speed on the
+pair before committing to the MMQ build-wiring (step 2). The decode dots being already present means Q4_K_M decode
+might be acceptable without the MMQ prompt path.
+
+**Tried 2026-10-13 (make-it-work), and it surfaces the REAL blocker.** Q4_K_M admitted to setup (MODELS +
+SUPPORTED_GGUFS + model-level `pack_args: ["--compat-bf16"]`, and setup.py's pack call changed to
+`MODELS[model].get("pack_args", fam.get(...))` since pack_args was family-only). The pack builds fine. **The
+engine accepts the K-quant and runs the load** (`token embedding Q4_K in mapped host memory`, `native Q5_K head`,
+expert cache fills) — the decode-dot premise holds. **But it REFUSES to start for a memory reason, on both one
+card and the pair:**
+
+- Single B70 (131K): 15,681 of 16,721 non-resident experts mirrored (47.8 GiB, the RAM pinning cap), 1,040 left
+  with nowhere to live → REFUSED.
+- Pair split (131K): 9,032 + 8,602 resident; 3,256 mirrored; **3,686 of the LATER stage (B70, layers 24-47) fit
+  neither in its VRAM (26.2 GiB cache holds 8,602 of 12,288) nor the mirror** → REFUSED.
+- Pair split at **65,536** context: still **3,665** unhomed (barely moved) — **the shortfall is NOT KV/context.**
+  The cause is structural: the B70 stage holds 46 layers' worth of dense weights + head + MTP AND the whole
+  session KV, so its expert cache is squeezed, and the host mirror only covers the FIRST stage (B65), so the
+  squeezed stage's overflow has no fallback.
+
+**The actual WS5 work to make Q4_K_M serve on this pair** (none of it is the K-quant kernels — those are fine):
+
+1. **Split the KV / session state across the cards** (or `--kv-resident` harder) so the B70 stage isn't carrying
+   the whole context's KV on top of its layers — freeing its expert cache.
+2. **Extend the host mirror to cover later split stages** (today it covers only the first stage under
+   `STRATA_VERIFY_NO_HOST`), so a later stage's overflow can be mirrored. This is the engine's own suggested fix
+   direction.
+3. **A VRAM-weighted or capacity-aware split** for unequal-VRAM-role pairs (the head/MTP card needs more room),
+   rather than the balanced `--layer-split 24` that's right for equal-residency i-quants but starves the
+   head-card on a 62 GB model.
+
+Until one of those lands, **IQ3_S is the quality ceiling that runs on the pair today** (50 GB arena fits; 67
+tok/s, 131K validated); Q4_K_M (62 GB) is just over the line. This is the honest WS5 status: K-quant *support*
+works; K-quant *capacity planning on a split* is the open work.
+
 ## Explicit non-goals
 
 - Windows / WSL2 support (INTEL_ARC.md's Windows section stays accurate).

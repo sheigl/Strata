@@ -230,6 +230,14 @@ MODELS = {
                   "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
                   "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "engine": (0, 1, 38),
                   "vision": True},
+    # WS5 (Intel Arc, docs/specs/intel-arc-dual-gpu.md): a plain K-quant for the SYCL port. The engine's K-quant
+    # decode dots and dequant kernels already run Q4_K; there is no SYCL MMQ prompt path yet, so prompts take the
+    # dequant->oneMKL fallback (slower). Local file only (no HF download here): pass --gguf-dir.
+    "Q4_K_M": {"about": "4-bit K-quant (EXPERIMENTAL, Intel SYCL): the best quality; the prompt path is not "
+                        "ported yet, so prompts are slower than the i-quants",
+               "download_gb": 0.0, "ram_gb": 48, "arena_gb": 62.0, "families": ("swift",), "shards": 3,
+               "file": "Swift-1.5-Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "experimental": True,
+               "vision": False, "pack_args": ["--compat-bf16"]},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).
@@ -1577,9 +1585,10 @@ def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
 GGUF_QUANT = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:I?Q\d+(?:_[A-Za-z0-9]+)*|BF16|F16|F32))"
                         r"(?=-\d{5}-of-\d{5}\.gguf$|\.gguf$)", re.I)
 SUPPORTED_GGUFS = ("Strata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next Q2_0, IQ2_XS, IQ3_XXS, IQ3_S; Swift "
-                   "1.5's; the Coder's IQ1_M) and Unsloth's UD-Q4_K_XL and UD-IQ4_XS only: other GGUFs (Unsloth's "
+                   "1.5's; the Coder's IQ1_M), Unsloth's UD-Q4_K_XL and UD-IQ4_XS, and (experimental, Intel SYCL) "
+                   "Swift 1.5's Q4_K_M: other GGUFs (Unsloth's "
                    "UD-IQ3_XXS or "
-                   "UD-Q2_K_XL, K-quants) cannot be used")
+                   "UD-Q2_K_XL, other K-quants) cannot be used")
 
 
 def gguf_unsupported(name: str) -> str | None:
@@ -5580,7 +5589,7 @@ def main() -> int:
         # every tensor as the GGUF stores it; the experts are read from the GGUF at start (seconds to build)
         # (UD-Q4_K_XL: --compat-bf16 - its Q8_0 hyper-connection projections become BF16, the form the engine reads)
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
-             *fam.get("pack_args", [])], env=env)
+             *MODELS[model].get("pack_args", fam.get("pack_args", []))], env=env)
     if low_ram and not (pack / "experts.bin").exists():
         say(f"  Writing the experts into one file for the low-RAM mode (one time, {MODELS[model]['arena_gb']:.0f} GB) ...")
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
