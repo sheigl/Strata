@@ -205,6 +205,28 @@ Until one of those lands, **IQ3_S is the quality ceiling that runs on the pair t
 tok/s, 131K validated); Q4_K_M (62 GB) is just over the line. This is the honest WS5 status: K-quant *support*
 works; K-quant *capacity planning on a split* is the open work.
 
+**Capacity-fix sizing (2026-10-13, from `sycl/src/program/generate.cpp`):**
+
+- The limitation is explicit in code (`#1980`, lines 4970-4987): the host mirror and the REFUSED count cover the
+  **first stage only**. Under `STRATA_VERIFY_NO_HOST` (required on xe), a later split stage whose cache can't
+  hold all its layers' experts has **no host fallback** → REFUSED with the exact message we hit.
+- `later_misses` (line 4979) = Σ over later stages of `(le-lb)*n_expert − cache.slots`. For Q4_K_M at
+  `--layer-split 24`: the B70 stage is layers 24-47 (24 layers × 512 = 12,288 pairs) minus its 8,602-slot cache =
+  **3,686 misses**, all unhomed. Its cache is squeezed because the head card carries the dense weights of 24
+  layers + the output head + the MTP draft + the **entire session KV** on top of its experts.
+- **Fix ranking:**
+  - **(1) Extend the host mirror to later stages — the real fix.** Per-stage mirrors so a later stage's overflow
+    is served (slowly) instead of refused. Medium engine change (allocate + verify-path per stage); directly
+    removes the REFUSED. This is the general solution and matches the engine's own comment.
+  - **(2) Capacity-aware split placement — cheap to try, uncertain.** Skew layers onto the B65 (higher K) so the
+    B70's 12,288 pairs fit its cache. Empirically slow to test (each fill is ~5 min) and the gap is large; a
+    balanced 24 is wrong for a 62 GB model but the needed skew may be extreme. Worth one or two more measured
+    attempts (K=32/36) before dismissing, but not the structural fix.
+  - **(3) Split the session KV across cards / lean harder on `--kv-resident` — largest.** Moves the head card's
+    biggest non-expert load off it. Architectural; highest risk.
+- **Recommendation:** Fix 1 is the durable answer and the upstreamable one; Fix 2 is a same-day experiment to
+  confirm the pair *can* hold Q4_K_M at all. Effort on Fix 1 is days of careful verify-path work, not weeks.
+
 ## Explicit non-goals
 
 - Windows / WSL2 support (INTEL_ARC.md's Windows section stays accurate).
