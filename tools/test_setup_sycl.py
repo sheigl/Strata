@@ -213,6 +213,65 @@ class ToSycl(unittest.TestCase):
         self.assertTrue(m.small_card(10.0, "xe"))
         self.assertFalse(m.small_card(32.0, "xe"))
 
+    def test_no_images_keeps_the_section_out_of_the_config(self):
+        """A setup run that asked for nothing writes no vision block: the config is what it was before the SYCL port
+        read pictures at all."""
+        m = self.mod()
+        c = m.to_sycl(self.cfg(m), m.ROOT / "build-sycl" / "strata", 64.0, {}, 32.0, "xe")
+        self.assertNotIn("vision", c)
+
+    def test_a_vision_section_keeps_everything_but_its_encoder_path(self):
+        """setup writes the block for its CUDA/HIP engine, whose encoder sits beside that engine; the SYCL config points
+        at the one beside the SYCL engine.  The mmproj and the model shard stay host files - the encoder runs on the
+        host, and the engine only ever sees the embeddings file."""
+        m = self.mod()
+        cfg = self.cfg(m)
+        cfg["vision"] = {"exe": str(m.ROOT / "build-hip" / "strata-vision"),
+                         "mmproj": "/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+                         "model": "/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+                         "gpu": False, "max_tokens": 300, "threads": 8}
+        c = m.to_sycl(cfg, m.ROOT / "build-sycl" / "strata", 64.0, {}, 32.0, "xe")
+        self.assertEqual(c["vision"]["exe"], str(m.ROOT / "build-sycl" / "strata-vision"))
+        for key in ("mmproj", "model", "gpu", "max_tokens", "threads"):
+            self.assertEqual(c["vision"][key], cfg["vision"][key], key)
+
+
+class VisionEncoder(unittest.TestCase):
+    """The image encoder on the SYCL port: the CPU one when it is asked for, off for anything else (no SYCL build of
+    the encoder exists yet) - and off when nothing was asked for, which is what the port did before."""
+
+    @staticmethod
+    def mod():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("setup_intel", ROOT / "sycl" / "setup_intel.py")
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def test_only_cpu_turns_images_on(self):
+        m = self.mod()
+        self.assertEqual(m.sycl_vision_answer(None), "none")
+        for asked in ("no", "none", "yes", "gpu", ""):
+            self.assertEqual(m.sycl_vision_answer(asked), "none", asked)
+        self.assertEqual(m.sycl_vision_answer("cpu"), "cpu")
+
+    def test_the_encoder_sits_beside_the_engine_it_serves(self):
+        m = self.mod()
+        self.assertEqual(m.host_vision_exe(m.ROOT / "build-sycl" / "strata"),
+                         m.ROOT / "build-sycl" / setup.VEXE)
+
+    def test_q4_k_m_gets_its_own_mmproj_name_and_repository(self):
+        """The plain Swift 1.5 release Q4_K_M comes from names its encoder after itself and ships it with its shards;
+        every other model still gets its family's file (the default path is unchanged)."""
+        self.assertEqual(setup.model_mmproj(setup.FAMILIES["swift"], "Q4_K_M"),
+                         ("mmproj-Swift-1.5-Qwen3.8-Flash-Next-BF16.gguf",
+                          setup.hf("ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF")))
+        for model, family in (("IQ3_S", "qwen"), ("UD-Q4_K_XL", "unsloth"), ("IQ1_M", "coder")):
+            with self.subTest(model=model):
+                self.assertEqual(setup.model_mmproj(setup.FAMILIES[family], model),
+                                 (setup.FAMILIES[family]["mmproj"], setup.FAMILIES[family]["mmproj_hf"]))
+        self.assertIsNot(setup.MODELS["Q4_K_M"].get("vision"), False)
+
 
 if __name__ == "__main__":
     unittest.main()

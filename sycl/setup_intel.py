@@ -7,10 +7,14 @@ it and replaces the few steps that are NVIDIA/AMD-specific, then runs setup's ow
 model choice, the download, the pack, the tokenizer, the MTP draft layer, the context and KV questions - is
 setup.py's, unchanged.  What is replaced:
 
-  - the GPU check: the Intel Arc is offered through setup's AMD path (the one that compiles locally and has no
-    images), named and sized from sysfs;
+  - the GPU check: the Intel Arc is offered through setup's AMD path (the one that compiles locally), named and
+    sized from sysfs;
   - the engine step: the SYCL build (build-sycl-aot/strata, run in the strata-sycl-dev image by
     sycl/serve/strata-sycl.sh; docs/INTEL.md) instead of a CUDA/HIP build;
+  - the image encoder: setup's own CPU step (--vision cpu), building tools/vision without CUDA beside the SYCL
+    engine, so a picture is read by the CPU and only its embeddings reach the engine.  There is no SYCL (GPU) build
+    of the encoder yet, so --vision gpu leaves images off, as before, and asked for nothing images stay off (docs/
+    INTEL.md, "Images");
   - the RAM rule: the CUDA engine keeps every expert in RAM, the SYCL port streams them from the GGUF into VRAM
     (--stream-experts), so RAM only bounds the KV streaming;
   - the config: the container's paths, the SYCL flags, backend "sycl"; the run script starts
@@ -131,6 +135,18 @@ def small_card(vram_gb: float, driver: str) -> bool:
     return 0 < vram_gb < SMALL_CARD_GB or driver == "i915"
 
 
+def sycl_vision_answer(asked) -> str:
+    """setup's --vision answer for the SYCL port: the CPU image encoder when it is asked for, images off for anything
+    else.  A SYCL (GPU) build of the encoder does not exist yet, so `yes`/`gpu` answer like `no` - the same answer the
+    AMD port gives for its missing HIP encoder (setup.hip_vision); the warning is said where the answer is used."""
+    return "cpu" if asked == "cpu" else "none"
+
+
+def host_vision_exe(exe: Path) -> Path:
+    """Where the image encoder sits for a SYCL engine: beside it, named as setup.py names it next to a CUDA/HIP one."""
+    return exe.parent / S.VEXE
+
+
 def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, driver: str = "xe",
             devid: str = "") -> dict:
     """setup's config (written for its HIP path) -> the SYCL port's: the container's paths, experts streamed from the
@@ -188,7 +204,7 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
         args += ["--prefill", "4096"]                   # over PCIe once per chunk, so fewer, bigger chunks read the prompt
                                                         # faster (Arc Pro B70, IQ3_S, a 4,095-token prompt: 2,048-token
                                                         # chunks 618 tok/s, 4,096: 1,002; docs/INTEL.md); it costs ~700 cache slots
-    out = {k: v for k, v in cfg.items() if k not in ("lib_dirs", "env", "vision", "gpus")}
+    out = {k: v for k, v in cfg.items() if k not in ("lib_dirs", "env", "gpus")}
     out.update({"backend": "sycl", "exe": str(SYCL_WRAPPER), "args": args, "sycl_root": str(MOUNT)})
     env = {}
     if alchemist:
@@ -206,6 +222,16 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
         env["STRATA_SYCL_ROOT"] = str(MOUNT)
     if env:
         out["env"] = env
+    if isinstance(cfg.get("vision"), dict):
+        # the picture is read on the host by the CPU encoder beside the SYCL engine, and it reads the mmproj and the
+        # model's first shard as ordinary host files - setup wrote both paths for its CUDA/HIP engine, and the engine
+        # never sees them: what reaches the engine is only the embeddings, in the file named on a GENI line.  So the
+        # folder holding that file has to be one the engine sees too: it is when the engine runs on the host
+        # (build-sycl/strata through sycl/serve/strata-sycl-host.sh); the strata-sycl-dev container would need it
+        # under the /work mount, which is not wired (docs/INTEL.md, "Images").
+        v = dict(cfg["vision"])
+        v["exe"] = str(host_vision_exe(exe))
+        out["vision"] = v
     out.update(keep)
     return out
 
@@ -260,7 +286,25 @@ def install(argv) -> None:
     S.gpus = lambda *a, **k: []
     S.amd_gpus = lambda *a, **k: intel
     S.amd_problem = lambda g: None
-    S.hip_vision = lambda asked: "none"                 # images are not wired on the SYCL port yet
+
+    def sycl_vision(asked) -> str:
+        """setup's image-encoder step for the SYCL port: its own CPU step (#304), run beside the SYCL engine instead
+        of beside a HIP one.  The engine already reads the encoder's embeddings (the GENI line and the image M-RoPE
+        table, sycl/src/program/generate.cpp - 1.6 MiB per card at 131,072 context), so no SYCL kernel is needed to
+        read a picture; a GPU build of the encoder is a later step, so `yes`/`gpu` leave images off, as before."""
+        if asked in ("yes", "gpu"):
+            S.warn("the SYCL port has no GPU image encoder yet: images off"
+                   " (--vision cpu reads them on the CPU)")
+        if (answer := sycl_vision_answer(asked)) != "cpu":
+            return answer
+        stamp = stub / "BUILD.json"
+        S.build_vision_cpu(exe.parent, stamp, json.loads(stamp.read_text(encoding="utf-8")),
+                           S.get_llama_cpp(), S.source_hash(S.VISION_SOURCES))
+        link = stub / S.VEXE                            # setup looks for the encoder beside the engine dir it is
+        if not link.exists():                           # handed, which here is the stand-in for the SYCL build
+            link.symlink_to(host_vision_exe(exe))
+        return "cpu"
+    S.hip_vision = sycl_vision
     S.build_engine_hip = lambda *a, **k: stub
     S.hipblaslt_table = lambda *a, **k: None
     S.ram_gb = lambda: fake_ram                         # the experts are in VRAM: setup's RAM rule does not apply
@@ -327,8 +371,8 @@ def install(argv) -> None:
     sys.argv = [str(ROOT / "setup.py"), *argv]
     if "--backend" not in argv:
         sys.argv += ["--backend", "hip"]
-    if "--vision" not in argv:
-        sys.argv += ["--vision", "none"]
+    # --vision is left to setup: its answer here is sycl_vision() above, which is "none" when nothing was asked for -
+    # the same config as before this step existed - and "cpu" for --vision cpu.
     if "--low-ram" not in argv:
         sys.argv += ["--low-ram", "off"]
     sys.exit(S.main())
