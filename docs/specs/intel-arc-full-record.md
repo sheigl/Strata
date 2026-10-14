@@ -191,7 +191,16 @@ parked, that could matter on this hardware:
   `strata-q4km` (ids `strata:iq3_s` / `strata:q4_k_m`), launched by the local scripts `run-iq3_s-split.sh` /
   `run-swift-q4_k_m-split.sh` (gitignored — machine-local). Both use both Arcs, so they sit in no shared set:
   each runs alone and evicts everything else. llama-swap polls `/health` (503 while the cache fills; the config's
-  `healthCheckTimeout: 900` covers the slow first load). Verified working 2026-10-13: a request to `strata-iq3s`
-  on `:8080` loaded the engine and answered.
+  `healthCheckTimeout: 900` covers the slow first load). Both have `ttl: 0` (never auto-unload; the active one
+  stays resident until you swap). Verified working 2026-10-13: a request to `strata-iq3s` on `:8080` loaded the
+  engine and answered.
+- **Sampling (set 2026-10-13):** both configs carry `"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`
+  — Swift-1.5's own `generation_config.json` recommendation (and Strata's documented default sampler). Without the
+  block the engine runs *greedy* (temp 0), which on a reasoning model can loop on long thinking chains; the block
+  makes plain clients sampled by default. Applied via the server's `sampling_defaults_from_config` (the request's
+  own fields still win; an explicit temperature=0 still means greedy).
+- **Remote access (Tailscale):** the configs' `allowed_hosts` include `sheigl-ms-7a38.tailc63ae8.ts.net`, so the
+  models answer over Tailscale (Strata's DNS-rebinding check otherwise blocks a non-localhost Host header). Add any
+  new hostname the same way.
 - House rules for any PR off this work: one change per PR, opt-in, default path byte-identical, measured numbers
   with the hardware named, build every backend a file touches.
