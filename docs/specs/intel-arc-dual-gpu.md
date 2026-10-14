@@ -79,6 +79,13 @@ follow-ups are listed in that doc.
   What's missing is only setup: `sycl/setup_intel.py` hardcodes `hip_vision → "none"` and forces `--vision none`.
   The work is to build `strata-vision` for the SYCL backend and stop suppressing vision in setup — no engine
   kernel changes needed.
+  **The B580 as a vision-encode card (option, deferred 2026-10-13):** the encoder is small (~0.9 GB mmproj) and
+  CPU-capable (measured `READY 2560` in 3.2 s on the i7-11700K), and encoding is a once-per-image cost, not the
+  decode bottleneck — so a GPU encode is low-value. `strata-vision` today only builds a CUDA GPU path
+  (`STRATA_VISION_CUDA` → `GGML_CUDA`); running the tower on the B580 would need a SYCL/Vulkan build of it
+  (llama.cpp's SYCL build proves Arc vision works — `llama-mtmd-cli`/`libmtmd.so` exist in the user's separate
+  llama.cpp build). Do the CPU-encode wiring first; add a GPU-encode build only if CPU encode proves too slow in
+  real use.
 - Extend `tools/test_setup_sycl.py`-style setup tests so the matrix stays honest without a GPU.
 - Acceptance: gate 1.
 
