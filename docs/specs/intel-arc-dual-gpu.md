@@ -71,6 +71,11 @@ follow-ups are listed in that doc.
 - Enumerate what setup offers on CUDA (variants, quants, vision, MTP, KV modes) and make the Intel path offer
   the same set, minus only entries with a *measured, documented* reason.
 - Wire the missing pieces the parity table already flags (images on Intel are "not yet"; audit the rest).
+  **Done on the CPU encoder 2026-10-14 — see §10 of
+  [intel-arc-full-record.md](intel-arc-full-record.md) and "Images on the SYCL port" in [../INTEL.md](../INTEL.md).**
+  `--vision cpu` now runs setup's own CPU encoder step (`setup.build_vision_cpu`, #304) beside the SYCL engine and the
+  SYCL config keeps its `vision` block; `--vision gpu` warns and leaves images off; nothing asked for is images off, as
+  before. Measured encode on the pair's PC: 2.4-3.0 s for a 300-token picture, 22.3 s at 1,024 tokens, no VRAM used.
   **Re-scoped 2026-10-13: vision-on-Intel is plumbing, not a kernel port, and the CPU-encode path already works.**
   The encoder (`tools/vision/strata_vision.cpp`) is CPU-capable by design (llama.cpp mtmd; the CPU path hides the
   GPU entirely). Verified on this machine: `build-vision/bin/strata-vision` built and, on the Swift-1.5 Q4_K_M

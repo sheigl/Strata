@@ -147,7 +147,9 @@ would speed prompt *ingest* but not the decode number — so it is not the first
 7. **Intel multi-GPU offering in setup** — today a two-Arc machine is never *offered* pooling the way NVIDIA is;
    the chooser (`choose_gpus`/`together_ok`) is NVIDIA-shaped (`int(g["arch"])` raises on `arch="xe"`). Wire the
    offer so `--gpus 0,1` / auto is presented.
-8. **Images on Intel** (the parity table's "not yet"), and the rest of the parity matrix audit.
+8. **Images on Intel** — done 2026-10-14 on the CPU encoder (§10): `--vision cpu` builds and wires
+   `strata-vision` beside the SYCL engine. What is left of that item is a SYCL (GPU) build of the encoder, and the
+   rest of the parity matrix audit.
 
 ## 7. Intel-specific optimizations worth investigating (deeper, from the docs' own roadmap)
 
@@ -204,3 +206,56 @@ parked, that could matter on this hardware:
   new hostname the same way.
 - House rules for any PR off this work: one change per PR, opt-in, default path byte-identical, measured numbers
   with the hardware named, build every backend a file touches.
+
+## 10. Images on Intel: the CPU vision tower (2026-10-14)
+
+**The premise that needed correcting:** the parity table's "images: not yet" read as if the vision path had to be
+ported. It does not. The SYCL engine has the whole read side — `--vision` is parsed in
+`sycl/src/program/generate.cpp:1860`, the image M-RoPE table is allocated at start (`:2897`, `(max_context+64) x 3`
+int32 per card = 1.6 MB at 131,072), and the `GENI <max_new> <embeddings file> <ids>` request is read and its `SVE1`
+embeddings validated (`:8652`, width check `:9606`). What was missing was only the encoder and the setup/config
+wiring: `sycl/setup_intel.py` stubbed `hip_vision` to `"none"`, `to_sycl` deleted any `vision` block, and the forced
+`--vision none` was appended to setup's argv. So this was plumbing, not a kernel port.
+
+**What changed** (3 files, all opt-in; the default path writes the same config as before):
+
+- `sycl/setup_intel.py`: `sycl_vision_answer()` maps setup's `--vision` to `cpu`/`none` (`yes`/`gpu` answer `none`
+  with a warning — there is no SYCL build of the encoder, the same answer the AMD port gives for its missing HIP
+  one). `sycl_vision()` calls upstream's own CPU step (`setup.build_vision_cpu`, #304), which configures
+  `tools/vision` with `-DSTRATA_VISION_CUDA=OFF` into `build-vision/` and installs the binary beside the SYCL engine
+  as `build-sycl/strata-vision`; a symlink of the same name is left in setup's stand-in engine dir so setup's own
+  "is the encoder there" checks hold. `to_sycl` now keeps the `vision` block and rewrites only its `exe`. The forced
+  `--vision none` is gone, so the default reaches `hip_vision(None) -> "none"`.
+- `setup.py`: `MODELS["Q4_K_M"]` gets `"vision": True` plus model-level `mmproj` / `mmproj_hf` keys, read through a
+  new `model_mmproj(fam, model)` helper (the house pattern of `model_file`/`model_shards`). It has to be per-model:
+  the plain (non-GSQ-RCO) Swift 1.5 release names its encoder `mmproj-Swift-1.5-Qwen3.8-Flash-Next-BF16.gguf` and
+  ships it in its own repo, which is now pinned in `HF_REVISIONS` too. Every other model still resolves its family's
+  file (guarded by a test).
+- `tools/test_setup_sycl.py`: 5 new tests — the `--vision` answer map, the encoder's location, the Q4_K_M mmproj and
+  repository against every other model's family default, the `vision` block keeping
+  `mmproj`/`model`/`gpu`/`max_tokens`/`threads` while its `exe` moves, and no block at all when nothing was asked for.
+  `tools/test_setup_choices.py`'s two Q4_K_M expectations were stale from the WS5 admission (Q4_K_M is a setup size
+  now) and are updated.
+
+**Measured** (this machine: B65 `e222` + B70 `e223`, i7-11700K, 62 GB, engine 0.1.43.1-sycl with IQ3_S loaded and
+answering — the CPU was not idle; encoder `mmproj-Qwen3.8-Flash-Next-BF16.gguf`, 907,543,008 bytes, size matched
+against the pinned HF revision):
+
+| picture | becomes | encode | encoder RSS |
+|---|---|---|---|
+| 512x512, 300-token cap | 256 tok (16x16) | 2.4 s | 1.07 GiB |
+| 1024x1024, 300-token cap | 289 (17x17) | 3.0 s at 8 threads, 2.7 s at 16 | 1.10 GiB |
+| 1024x1024, 1,024-token cap | 1,024 (32x32) | 22.3 s at 8 threads, 18.2 s at 16 | 2.19 GiB |
+
+`READY 2560` prints 0.7 s after start with IQ3_S's shard 1 as `--model` (3.2 s with the Q4_K_M shard) — metadata only,
+no 54 GB load. The embeddings file is the `SVE1` record (`n x 2560` float32 + 20-byte header): 2.6 MB measured for the
+256-token picture. CPU encode costs **no VRAM**, so the tuned `--vram-reserve-mib` (1,024 MiB on the
+Q4_K_M config) is unchanged; the engine's only image cost is the 1.6 MB M-RoPE table. The 300-token
+default is setup's (`VISION["cpu"]`); mtmd wants >= 1,024 for Qwen-VL grounding, which is the 22 s row.
+
+**Not tested:** one image end to end through the API. The encoder side is measured; the engine's `GENI` read needs a
+model start with `--vision`, and the model serving this session is the one under test, so activation (a reload) is
+left to the operator. Two known gaps left open deliberately: the embeddings land in the system temp dir, which the
+`strata-sycl-dev` container does not share with the host (the native host path works; wiring that folder under
+`/work` would mean touching shared `serve/server.py`), and there is no SYCL build of the encoder — the idle B580
+(`e20b`, bmg-g21) as an encode card stays the deferred option in §6.

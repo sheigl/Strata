@@ -23,7 +23,7 @@ PCIe 3.0 x8 slot (the card trains at Gen3 x8 there; it can do Gen5 x16).
 | decode, Coder IQ1_M | 44-51 tok/s on an RTX 5070 | **78.2 tok/s** (19-token prompt, 256 greedy tokens), **75.7** after a 2,184-token prompt, 69 after 40K, 66.6 after 128K, 55.9 after 256K; 48-72 through the API | 23-25 tok/s |
 | prompt reading | ~1,870 tok/s | **790 tok/s** at 2,184 tokens, 1,117 at 40K, 888 at 128K, 757 at 256K | ~150 tok/s (424 at 105K) |
 | speculative decoding (MTP) | yes | yes (the base checkpoint's draft layer; 70-85% of drafts accepted on code) | no |
-| images | yes | not yet | not yet |
+| images | yes | yes, read on the CPU (see "Images on the SYCL port") | not yet |
 | context | up to 262K | 256K measured, 56 tok/s decode there (`--kv-resident`: the KV in pinned host memory, the attended window in VRAM) | 131K measured ceiling |
 
 Decode speed with speculative decoding depends on the text: code drafts well, prose less so (see "Speed depends
@@ -58,9 +58,12 @@ setup.py itself is unchanged). The model choice, download, pack, tokenizer, MTP 
 questions are setup's own. What changes:
 
 - **GPU check:** the Arc is found in sysfs (vendor 8086 under `xe` or `i915`) and offered through setup's AMD
-  path. That is the path that builds locally and has no images.
+  path, the one that builds locally.
 - **Engine step:** it uses the SYCL build (`build-sycl-aot/strata` or `build-sycl/strata`, run in the `strata-sycl-dev`
   image by `sycl/serve/strata-sycl.sh`) instead of compiling CUDA or HIP.
+- **Image encoder:** `--vision cpu` builds setup's CPU encoder (`tools/vision` without CUDA) and puts it beside the SYCL
+  engine; a picture is read by the CPU and only its embeddings reach the engine. Nothing asked for means images off,
+  and `--vision gpu` says there is no GPU encoder for this port and leaves them off (see "Images on the SYCL port").
 - **RAM rule:** this does not apply on an `xe` card. The CUDA engine keeps every expert in RAM; the port streams them from
   the GGUF into VRAM (`--stream-experts`), so RAM only decides the KV streaming. `--check` lists what fits by VRAM.
 - **The config:** it uses the container's paths and `"backend": "sycl"`. The VRAM reserve is 1,024 MiB up to
@@ -731,8 +734,9 @@ Measured on an Arc A750 (8 GB, `i915`, PCIe 4.0) with the Flash-Next IQ3_XXS in 
 
 ## Not done
 
-- Images, on both Intel engines. Strata's vision path encodes with `strata-vision` into embeddings the CUDA
-  engine reads; neither the SYCL port nor the llama.cpp config wires it yet.
+- Images on Intel are read by the CPU, not the card: `--vision cpu` builds `tools/vision` without CUDA and the picture
+  is encoded there (2.4-3.0 s for a 300-token picture, below). A SYCL build of the encoder does not exist, so
+  `--vision gpu` on an Arc says so and leaves images off, as before. On the llama.cpp path images are not wired at all.
 - Speculative decoding on the llama.cpp path (the GGUF carries no draft layer llama.cpp can use). The SYCL
   port has it (MTP draft layer, `--mtp`).
 
@@ -851,3 +855,48 @@ gate identical in the 32K and the 128K configuration); every one has an off swit
 | decode | 23-25 tok/s; GPU 92% busy at 165 W, CPU idle |
 | prefill | 149 tok/s on a 2,701-token prompt; 424 tok/s on a 104,798-token prompt at 131k context |
 | quality | correct code on every test; matches the NVIDIA path token for token in spirit, not measured |
+
+## Images on the SYCL port: the CPU encoder (2026-10-14, branch intel-arc-b70-b65)
+
+The engine could already read pictures: `--vision` is parsed in `sycl/src/program/generate.cpp`, which sizes the image
+M-RoPE table at start and reads the `GENI <max_new> <embeddings file> <ids>` request the serve layer sends. What was
+missing was the encoder and the wiring around it, so `sycl/setup_intel.py` answered every `--vision` with "none" and
+dropped the block out of the config.
+
+Now `--vision cpu` runs setup's own CPU step (#304, the one the AMD path uses): `tools/vision` is configured without
+CUDA into `build-vision/` and the binary is put beside the SYCL engine, `build-sycl/strata-vision`, which is where the
+config's `vision.exe` points. The encoder is a host process: it reads the mmproj and the model's first shard (for the
+vocabulary) and writes float32 embeddings into a temp folder; the engine is started with `--vision` and reads that
+file. No encoder weights and no picture reach the card, so the configs' tuned `--vram-reserve-mib` (1,024 MiB for the
+Q4_K_M pair) stays as it is. Asked for nothing, `--vision` is still "none" and the config is what it was before this
+step existed.
+
+Measured on the B65 + B70 pair's PC (i7-11700K at 8 and 16 threads, 62 GB RAM, engine 0.1.43.1-sycl with IQ3_S loaded
+and answering, so the CPU was not idle; encoder `mmproj-Qwen3.8-Flash-Next-BF16.gguf`, 907,543,008 bytes):
+
+| picture | becomes | encode | encoder RSS |
+|---|---|---|---|
+| 512x512, 300-token cap | 256 tokens (16x16) | 2.4 s | 1.07 GiB |
+| 1024x1024, 300-token cap | 289 (17x17) | 3.0 s at 8 threads, 2.7 s at 16 | 1.10 GiB |
+| 1024x1024, 1,024-token cap | 1,024 (32x32) | 22.3 s at 8 threads, 18.2 s at 16 | 2.19 GiB |
+
+It prints `READY 2560` 0.7 s after being started with IQ3_S's first shard as `--model` (3.2 s with the Q4_K_M shard),
+and its embeddings file is the `SVE1` record the engine checks - `n x 2560` float32 plus a 20-byte header, so 2.6 MB
+for the 256-token picture (measured) and 10.5 MB at 1,024 tokens (that size, not measured). What the engine itself
+spends on images is the M-RoPE table above, `(max_context + 64) x 3` int32 per card: 1.6 MB at 131,072 context.
+
+300 image tokens is setup's default for a CPU encoder, and `--vision-tokens N` raises it; llama.cpp's mtmd asks for at
+least 1,024 for Qwen-VL grounding work, which is the 22 s row here. `"min_tokens": N` in the config's `vision` section
+scales a small picture up instead of capping a large one down - "A minimum number of image tokens" in docs/DETAILS.md.
+
+Two things are left open, on purpose:
+
+- The embeddings file goes in the system temp folder (`VisionEncoder.work_dir()` in `serve/server.py`), which the
+  `strata-sycl-dev` container does not share with the host. Images work on the native path (`sycl/serve/strata-sycl-host.sh`
+  with `build-sycl/strata`); through the container that folder would have to be under the `/work` mount.
+- A GPU build of the encoder for Arc. The engine side is already there; it is the encoder binary that has no SYCL
+  kernels. The idle Arc B580 as an encode card is written up in docs/specs/intel-arc-full-record.md.
+
+Not tested: one picture through the API end to end. The encoder side is measured; the engine's `GENI` read is not,
+because turning it on means starting the model again with `--vision` - add the `vision` block to a config and reload,
+and the first image tells you the rest.
