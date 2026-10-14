@@ -71,6 +71,14 @@ follow-ups are listed in that doc.
 - Enumerate what setup offers on CUDA (variants, quants, vision, MTP, KV modes) and make the Intel path offer
   the same set, minus only entries with a *measured, documented* reason.
 - Wire the missing pieces the parity table already flags (images on Intel are "not yet"; audit the rest).
+  **Re-scoped 2026-10-13: vision-on-Intel is plumbing, not a kernel port, and the CPU-encode path already works.**
+  The encoder (`tools/vision/strata_vision.cpp`) is CPU-capable by design (llama.cpp mtmd; the CPU path hides the
+  GPU entirely). Verified on this machine: `build-vision/bin/strata-vision` built and, on the Swift-1.5 Q4_K_M
+  mmproj + text model, loaded and printed `READY 2560` in 3.2 s on the CPU. The SYCL engine already reads the
+  resulting embeddings (`sycl/src/program/generate.cpp:8652`, the full GENI path with the M-RoPE image tables).
+  What's missing is only setup: `sycl/setup_intel.py` hardcodes `hip_vision → "none"` and forces `--vision none`.
+  The work is to build `strata-vision` for the SYCL backend and stop suppressing vision in setup — no engine
+  kernel changes needed.
 - Extend `tools/test_setup_sycl.py`-style setup tests so the matrix stays honest without a GPU.
 - Acceptance: gate 1.
 
