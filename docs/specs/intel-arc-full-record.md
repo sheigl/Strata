@@ -259,3 +259,20 @@ left to the operator. Two known gaps left open deliberately: the embeddings land
 `strata-sycl-dev` container does not share with the host (the native host path works; wiring that folder under
 `/work` would mean touching shared `serve/server.py`), and there is no SYCL build of the encoder — the idle B580
 (`e20b`, bmg-g21) as an encode card stays the deferred option in §6.
+
+**On this machine** (both gitignored split configs now carry the block, verified before writing):
+
+```json
+"vision": {"exe": "/mnt/1TB/AI/Strata/build-sycl/strata-vision",
+           "mmproj": "<the model's mmproj>", "model": "<the model's shard 1>",
+           "gpu": false, "max_tokens": 300, "threads": 8}
+```
+
+`strata-iq3_s-split.json` points at `mmproj-Qwen3.8-Flash-Next-BF16.gguf` + IQ3_S shard 1 (that mmproj was downloaded
+from the pinned GSQ-RCO revision: 907,543,008 bytes, exactly as Hugging Face lists it);
+`strata-swift-q4_k_m-split.json` at `mmproj-Swift-1.5-Qwen3.8-Flash-Next-BF16.gguf` + Q4_K_M shard 1. Both commands as
+the server builds them (`serve.engine_args`, `VisionEncoder`) were run by hand from a `/tmp/strata-vision-*` work dir
+with a 512x512 PNG: each printed `READY 2560` and then `OK 256 16 16` with a 2,621,460-byte embeddings file (Q4_K_M:
+3.2 s end to end, 1.04 GiB peak RSS). `engine_args` adds `--vision` to the engine itself, and does **not** touch
+`--vram-reserve-mib` for `"gpu": false`, so the tuned reserve survives. A wrong path here would stop the server at
+boot (`Vision._start` raises and nothing catches it), which is why the command was run standalone first.
