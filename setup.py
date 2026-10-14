@@ -68,6 +68,9 @@ HF_REVISIONS = {
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "b22d729eae29b5796f76fb70f91aef549b9fc52c",   # 2026-09-24
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
+    # the plain (not GSQ-RCO) Swift 1.5 release: Q4_K_M's shards and its own mmproj file, used by the Intel SYCL
+    # port's Q4_K_M (MODELS below); pinned here so its vision encoder download is a fixed file too
+    "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF": "0142554c963a8653912c0c8283f05f13f63653f3",          # 2026-09-24
 }
 
 
@@ -233,11 +236,14 @@ MODELS = {
     # WS5 (Intel Arc, docs/specs/intel-arc-dual-gpu.md): a plain K-quant for the SYCL port. The engine's K-quant
     # decode dots and dequant kernels already run Q4_K; there is no SYCL MMQ prompt path yet, so prompts take the
     # dequant->oneMKL fallback (slower). Local file only (no HF download here): pass --gguf-dir.
+    # Images: the model's own mmproj encoder sits with its shards, and the SYCL engine reads a CPU encoder's
+    # embeddings (sycl/setup_intel.py, docs/INTEL.md "Images"); setup writes the encoder for --vision cpu.
     "Q4_K_M": {"about": "4-bit K-quant (EXPERIMENTAL, Intel SYCL): the best quality; the prompt path is not "
                         "ported yet, so prompts are slower than the i-quants",
                "download_gb": 0.0, "ram_gb": 48, "arena_gb": 62.0, "families": ("swift",), "shards": 3,
                "file": "Swift-1.5-Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "experimental": True,
-               "vision": False, "pack_args": ["--compat-bf16"]},
+               "vision": True, "mmproj": "mmproj-Swift-1.5-Qwen3.8-Flash-Next-BF16.gguf",
+               "mmproj_hf": hf("ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF"), "pack_args": ["--compat-bf16"]},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).
@@ -1200,6 +1206,14 @@ def model_file(fam: dict, model: str, i: int) -> str:
 
 def model_shards(fam: dict, model: str) -> int:
     return MODELS.get(model, {}).get("shards", fam.get("shards", 2))
+
+
+def model_mmproj(fam: dict, model: str) -> tuple:
+    """The vision encoder's file name and the repository it comes from: the family's, or the model's own.  The plain
+    Swift 1.5 release ships an encoder named for itself (mmproj-Swift-1.5-...), not the GSQ-RCO family's, and keeps it
+    beside its shards."""
+    d = MODELS.get(model, {})
+    return d.get("mmproj", fam["mmproj"]), d.get("mmproj_hf", fam["mmproj_hf"])
 
 
 def budget_model(cfg: dict) -> str:
@@ -5558,14 +5572,15 @@ def main() -> int:
         if s.name in fam.get("sha256", {}):
             verify_sha256(s, *fam["sha256"][s.name])
     ok("model files present")
-    mmproj = Path(a.models_dir) / fam["mmproj"]
+    mm_name, mm_repo = model_mmproj(fam, model)
+    mmproj = Path(a.models_dir) / mm_name
     if not mmproj.exists():
-        mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
+        mmproj = find_in(roots, f"models/{mm_name}") or mmproj
     if vision != "none":
-        if not mmproj.exists() and a.gguf_dir and (Path(a.gguf_dir) / fam["mmproj"]).exists():
-            mmproj = Path(a.gguf_dir) / fam["mmproj"]
+        if not mmproj.exists() and a.gguf_dir and (Path(a.gguf_dir) / mm_name).exists():
+            mmproj = Path(a.gguf_dir) / mm_name
         else:
-            download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
+            download(mm_repo + mm_name, mmproj, "vision encoder")
         ok(f"vision encoder: {mmproj}")
         if vision == "cpu" and "BF16" in mmproj.name:       # a tip only (recommend, never force; #625)
             say("       tip: on the CPU a Q8_0 copy of this encoder is a third smaller and about as exact (embedding "

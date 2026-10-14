@@ -110,7 +110,9 @@ class GgufDirUnsupported(unittest.TestCase):
     def test_quant_names(self):
         for name, want in (("Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf", "UD-IQ3_XXS"),
                            ("Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf", "UD-Q2_K_XL"),
-                           ("model-Q4_K_M.gguf", "Q4_K_M"),
+                           ("model-Q5_K_M.gguf", "Q5_K_M"),
+                           # Q4_K_M is a setup size now (experimental, Intel SYCL), by its own release's name
+                           ("Swift-1.5-Qwen3.8-Flash-Next-Q4_K_M-00001-of-00003.gguf", None),
                            ("Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf", None),
                            ("Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf", None),
                            ("my-IQ3_XXS-00001-of-00003.gguf", None), ("mmproj-F16.gguf", None),
@@ -122,7 +124,7 @@ class GgufDirUnsupported(unittest.TestCase):
         self.assertEqual(msg, "Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf is UD-IQ3_XXS, a GGUF Strata "
                               "cannot run")
         self.assertIn("ISTA-DASLab's GSQ-RCO files", hint)
-        self.assertIn("Unsloth's UD-Q4_K_XL and UD-IQ4_XS only", hint)
+        self.assertIn("Unsloth's UD-Q4_K_XL and UD-IQ4_XS", hint)
 
     def test_a_folder_without_the_choice_names_what_is_there(self):
         gsq = ["Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-%05d-of-00002.gguf" % i for i in (1, 2)]
