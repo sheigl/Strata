@@ -1,0 +1,61 @@
+{
+ "exe": "/mnt/1TB/AI/Strata/sycl/serve/strata-sycl-host.sh",
+ "args": [
+  "--pack",
+  "/mnt/1TB/AI/Strata-data/packs/iq3_s",
+  "--native",
+  "/mnt/1TB/AI/chat_models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+  "--ple-gguf",
+  "/mnt/1TB/AI/chat_models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+  "--expert-profile",
+  "/mnt/1TB/AI/Strata/data/expert-profile-sycl.bin",
+  "--expert-cache",
+  "auto",
+  "--spec",
+  "4",
+  "--spec-min-p",
+  "0.5",
+  "--mtp",
+  "/mnt/1TB/AI/Strata-data/mtp/rt",
+  "--max-context",
+  "131072",
+  "--kv",
+  "int8",
+  "--kv-resident",
+  "32768",
+  "--stream-experts",
+  "--vram-reserve-mib",
+  "2048",
+  "--prefill",
+  "4096",
+  "--layer-split",
+  "24",
+  "--split-device",
+  "1"
+ ],
+ "cwd": "/mnt/1TB/AI/Strata",
+ "tokenizer": "/mnt/1TB/AI/Strata-data/packs/iq3_s/tokenizer",
+ "model_name": "qwen3.8-flash-next-iq3_s-split",
+ "log": "/mnt/1TB/AI/Strata/strata-iq3_s-split.log",
+ "port": 8081,
+ "backend": "sycl",
+ "gpu": [
+  0,
+  1
+ ],
+ "gpus_asked": true,
+ "sycl_root": "/mnt/1TB/AI",
+ "env": {
+  "STRATA_SYCL_BIN": "build-sycl/strata",
+  "ONEAPI_DEVICE_SELECTOR": "level_zero:0,1",
+  "STRATA_STAGE_TRIM": "1"
+ },
+ "allowed_hosts": [
+  "sheigl-ms-7a38.tailc63ae8.ts.net"
+ ],
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 0.95,
+  "top_k": 20
+ }
+}
