@@ -169,6 +169,20 @@ def host_vision_exe(exe: Path) -> Path:
     return exe.parent / S.VEXE
 
 
+# #1980: on a layer split the host mirror covers the first stage only, so with STRATA_VERIFY_NO_HOST=1 (strata-sycl.sh's
+# default) a later stage that cannot hold all of its layers' experts is REFUSED at the start.  Measured on 2x Arc Pro B60
+# 24 GB with the trim and a 1024 MiB reserve: IQ3_XXS (42.9 GB of experts, 89% of the 48 GB) stage 1 2230-3731 experts
+# short and refused; NO_HOST=0 runs it at 39-50 tok/s with 0 faults.  IQ2_XS (35.5 GB, 74%) loads 100% resident.
+SPLIT_SHORT_FRACTION = 0.80
+
+
+def split_likely_short(arena_gb: float, vram_gbs: list) -> bool:
+    """True when the model's experts take so much of the split cards' VRAM that a later stage will not hold all of its
+    layers' experts (the dense weights, the KV, the prompt buffers, the drafter and the reserve take the rest)."""
+    total = sum(v for v in vram_gbs if v and v > 0)
+    return arena_gb > 0 and total > 0 and arena_gb > SPLIT_SHORT_FRACTION * total
+
+
 def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, driver: str = "xe",
             devid: str = "") -> dict:
     """setup's config (written for its HIP path) -> the SYCL port's: the container's paths, experts streamed from the
