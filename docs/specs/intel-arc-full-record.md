@@ -276,3 +276,85 @@ with a 512x512 PNG: each printed `READY 2560` and then `OK 256 16 16` with a 2,6
 3.2 s end to end, 1.04 GiB peak RSS). `engine_args` adds `--vision` to the engine itself, and does **not** touch
 `--vram-reserve-mib` for `"gpu": false`, so the tuned reserve survives. A wrong path here would stop the server at
 boot (`Vision._start` raises and nothing catches it), which is why the command was run standalone first.
+
+## 11. The third card: the B580 as expert cache (2026-10-15)
+
+### The ask, and what it turned out to be
+
+The B580 (12 GB) was idle. The stated reason for wanting it in the pool was **system RAM**: the Q4_K_M pair at 131K
+keeps a 19.44 GiB **pinned** host mirror. `free` puts it in `Buffers`, not in the engine's RSS (`VmRSS 2.2 GiB`,
+`VmLck 0`, `Buffers 16.9 GB` while it is built), so it is invisible to `ps`/`htop` but unswappable all the same:
+`MemAvailable` drops by the mirror's size. That is the memory the user is losing.
+
+Profiling the pair's decode made the second half of the case: in the pair the **last** stage (the B70 - head, MTP
+drafter and 8,873 of its 12,288 pairs) makes a host round trip inside every verify window, while a stage whose own
+layers are fully resident runs a `100% VRAM resident: zero-doorbell graph`. So a stage that holds only what it covers
+is worth more than its layer count suggests, and a card with a slow link should never hold overflow.
+
+### The measurements (same build, same day, same prompt)
+
+All three rows: Q4_K_M (`swift-q4_k_m` pack), `--max-context 131072`, `--vram-reserve-mib 1024`, `--prefill 4096`,
+`--kv int8 --kv-resident 32768`, `--spec 4`, `STRATA_SPLIT_MIRROR=1`, `STRATA_MIRROR_MIB 51200`, engine
+`0.1.43.1-sycl`, one 500-token reasoning answer at temperature 0 after a 68-token prompt.
+
+| layout | layers B65/B70/B580 | held pairs | mirror (build time) | start | decode | drafts accepted |
+|---|---|---|---|---|---|---|
+| pair | 24 / 24 / - | 18,232 | 19.44 GiB (170.8 s) | 550 s | 18.1 tok/s | 309/382 |
+| three | 22 / 24 / 2 | 19,822 | 14.51 GiB (99.7 s) | 280 s | 27.0 tok/s | 308/390 |
+| three | **18 / 25 / 5** | 21,301 | **9.78 GiB** (85.7 s) | 480 s | 26.3 tok/s | 316/416 |
+
+`held pairs` is read off the per-stage lines (`N of its M profiled pairs`); the mirror is the engine's own
+`STRATA_SPLIT_MIRROR: ... (X GiB, Y s)` line. The three-card rows are 45% faster on tokens per second and the last one
+halves the pinned RAM. The pair's 18.1 tok/s is *this* prompt: an earlier record on the same config (section 3) says
+29.5-32.2 tok/s, which was a different, shorter answer whose tokens route more inside `data/expert-profile-sycl.bin`
+(the profile is built from chat, code, maths and summaries). The two three-card rows exist to be compared with the
+pair row, not with that one - they are one build, one day, one prompt.
+
+### What was wrong in the engine
+
+1. **The measured coverage curve was gated to `ns >= 4`.** A 3-stage split fell back to the 0.1.39 power law
+   `(r+1)^-1.2`, which on this profile claimed 10,914 of 24,576 pairs held 97.5% of the routed mass. `auto` therefore
+   picked `K=2,47`: B65 2 layers (27.22 GiB free, 3.42 GiB used), B70 45 layers, B580 1 layer + the head. 14,286
+   experts unheld, mirror **43.36 GiB**, built in **561.6 s** (77 MiB/s), and the server declared `EngineDied: the
+   engine did not report READY within 900 s`. With `STRATA_SPLIT_COVER_B=3` the same search picked `K=15,41`
+   (predicted 53.x ms), still giving the B580 7 layers it cannot cover. Gate is now `ns >= 3`; `ns == 2` is untouched.
+2. **The SYCL port never got the CUDA engine's per-stage link pricing.** `src/program/generate.cpp` (lines ~3716,
+   3814) probes each stage's link inside the search, scales that stage's miss cost by `clamp(20.0 / bw, 1, 64)`, and
+   accumulates the missing routed mass **per stage**; the port had one global `held_mass` and one `miss_ms`. Ported
+   in shape. Logged on this machine: `CUDA0 link 13.8 GB/s -> miss cost x1.45`, `CUDA1 14.0 -> x1.43`,
+   `CUDA2 1.7 -> x11.67`. The port's probes read a *pinned* source, which is its own stage-probe convention since
+   0.1.41, where the twin reads a pageable one - only the absolute numbers differ, not the ratios. On equal links the
+   outcome is byte-identical, so a 2-GPU placement does not move. The pick it changes is measurable: with the coverage
+   curve on and this missing, `auto` chose `K=15,41` (the B580's 7 layers, 3,584 pairs, against its 2,560-slot
+   cache); with it, `K=18,43` - the B580's 5 layers, 2,560 of 2,560.
+3. **`sycl/setup_intel.py` never wrote `STRATA_SPLIT_MIRROR`.** Q4_K_M on any split is REFUSED without it
+   (`STRATA_VERIFY_NO_HOST=1` on xe), and the live configs only worked because the key had been added by hand - a
+   setup rerun would have dropped it. `split_env()` writes it (and `STRATA_STAGE_TRIM`) for every split;
+   `STRATA_MIRROR_MIB` is left to the engine.
+
+With 1 and 2 in place and **no environment variable**, `auto` now picks `K=18,43` - the measured-best shape, found by
+the engine instead of by hand.
+
+### Why B580 = 5 layers, and the shape rule
+
+B580 VRAM 11.93 GiB; after the dense weights, its session `[43,48)` and the head, 8.54 GiB is left for experts, which
+is exactly 2,560 pairs = 5 layers × 512. It holds `2560 of its 2560` = 100%, so **no miss ever touches its 1.71 GB/s
+link**. Its 160 CU at 2.85 GHz make its five layers cheap (1.27 ms each, measured by the search). Give it a sixth
+layer and the overflow moves onto the worst link in the machine; the mirror shrinks by nothing, because a pair is
+mirrored whether its own stage holds it or not.
+
+The B65 covers 18 of its own layers completely (9,216 slots / 9,216 pairs); the B70 takes the remaining 25 and covers
+9,518 of 12,800 = 74%, and its 3,282 missing pairs are the 9.78 GiB mirror. Total held 21,301 of 24,576, the ceiling
+for these three cards at this context.
+
+### Open
+
+- `auto` leaves the first stage **2.16 GiB less** free VRAM than an explicit `--layer-split` with the same K
+  (`expert cache auto: 27.94 GiB free -> 8070 slots` vs `30.10 -> 8718`; the search ran and the explicit path did
+  not), so its mirror is 11.27 GiB against 9.78. Reproduced twice, identical numbers. Something between the stage
+  setup and the search's `cap[]` loop holds VRAM on the first device; not yet found.
+- The search's absolute prediction is still far off the measurement (55.9 ms predicted, ~154 ms measured), although
+  its *ranking* is now right. The obvious next model: the last stage's misses cost more than the middle stages', since
+  nothing is behind them to hide the latency.
+- 135K / 200K context on three cards, and IQ3_S on three cards (its per-stage mirror should not even be needed), are
+  unmeasured. The B580 as a *vision encode card* (section 10) is still unbuilt.

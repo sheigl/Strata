@@ -900,3 +900,79 @@ Two things are left open, on purpose:
 Not tested: one picture through the API end to end. The encoder side is measured; the engine's `GENI` read is not,
 because turning it on means starting the model again with `--vision` - add the `vision` block to a config and reload,
 and the first image tells you the rest.
+
+## Three cards: the B580 as expert cache (2026-10-15, branch intel-arc-b70-b65)
+
+The B580 (12 GB) sat idle while the B65 + B70 pair served Q4_K_M at 131K. Two costs pointed at the same answer. First,
+RAM: every expert that fits in *neither* Pro's cache is copied into a **pinned** host mirror (`STRATA_SPLIT_MIRROR=1`),
+and pinned memory cannot be swapped, so it comes off the top of the machine. At 131K that mirror is **19.44 GiB** - the
+"a lot of system RAM" in `free` (it shows in `Buffers`, not in any process's RSS). Second, speed: the mirror is not
+free to use. A window that routes to a missing expert reads its blob over that card's link, and the verify window of
+the *last* stage cannot start until it has them, so the last stage's misses are on the critical path.
+
+Both costs fall with more cache, and the B580 is 10.9 GiB of it. The split has to give it only the layers it can hold
+*completely*: its link was measured at **1.71 GB/s** host->device (and 1.79 the other way) against 13.8/14.0 GB/s for
+the two Pros, so a miss on the B580 costs eight times a miss on a Pro - it should pay for cache, never for overflow.
+Five layers is what its 8.54 GiB of expert room covers (2,560 pairs, 100%).
+
+Measured, all three on the same day, same build (`0.1.43.1-sycl`), same prompt (a 500-token reasoning answer at
+temperature 0), Q4_K_M, `--max-context 131072`, `--vram-reserve-mib 1024`, `--prefill 4096`, `--kv int8
+--kv-resident 32768`, `--spec 4`, mirror cap 51,200 MiB:
+
+| layout | B65 / B70 / B580 layers | held pairs | mirror | start | decode |
+|---|---|---|---|---|---|
+| pair | 24 / 24 / - | 18,232 | **19.44 GiB** in 170.8 s | 550 s | 18.1 tok/s |
+| three, B580 starved | 22 / 24 / 2 | 19,822 | 14.51 GiB in 99.7 s | 280 s | 27.0 tok/s |
+| three, B580 full | **18 / 25 / 5** | 21,301 | **9.78 GiB** in 85.7 s | 480 s | 26.3 tok/s |
+
+The last row is the one to use: half the pinned RAM of the pair and 45% more tokens per second. Its per-stage lines:
+
+```
+layer split: CUDA1 runs layers 18-42, expert cache 9518 slots (28.25 GiB), 9518 of its 12800 profiled pairs
+layer split: CUDA2 runs layers 43-47, expert cache 2560 slots (8.54 GiB), 2560 of its 2560 profiled pairs
+layer split: CUDA0 runs layers 0-17
+STRATA_SPLIT_MIRROR: the split stages' misses mirrored in pinned host memory (9.78 GiB, 85.7 s)
+strata verify: window up to 6 tokens, 89.1 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+```
+
+The B580's stage reports the **zero-doorbell graph** - all of its layers' experts are in VRAM, so its verify window
+makes no host round trip. The pair's last stage (the B70, with the head, the MTP drafter and 8,873 of its 12,288 pairs)
+does, every window; that is the 18.1 against 26.3. Note the three-card rows are *slower* per layer on paper - the B65
+is the weak card (1.51 ms a layer against the B70's 0.81) - and still win, because a miss costs far more than a layer.
+
+The shape follows from the link, not from tuning: give the last stage only what it fully covers, then fill the rest.
+The B65 covers 18 of its own layers completely (9,216 slots for 9,216 pairs) and the B70 takes the remaining 25.
+
+Two engine defects had to be fixed for `auto` to find that shape, both measured:
+
+- `sycl/src/program/generate.cpp` gated the **measured** coverage curve to 4 or more stages (`ns >= 4`), so a 3-GPU
+  split used the old power law, which still claimed a profile 44% full held 97.5% of the routed mass. `auto` chose
+  `K=2,47` - 2 layers on the B65, 45 on the B70 - 14,286 experts unheld, a **43.4 GiB** mirror, 561.6 s building it,
+  past the server's 900 s readiness timeout: the model never started. The gate is now `ns >= 3`. No measured numbers
+  exist for a 2-GPU split moving, and it does not: `ns == 2` still uses the old curve.
+- The port was **missing the CUDA engine's per-stage link pricing**: `src/program/generate.cpp` scales each stage's
+  miss cost by `std::clamp(20.0 / bw, 1.0, 64.0)` and prices the missing mass per stage; the SYCL port priced one
+  global miss term. Ported. On this machine the search now logs `CUDA2 link 1.7 GB/s -> miss cost x11.67` against
+  `x1.45` and `x1.43` for the Pros. With the gate fixed and no environment variable set, `auto` picks **K=18,43** -
+  the same shape, reached by the engine rather than by hand. On equal links every placement is unchanged.
+
+`sycl/setup_intel.py` now writes the split's environment itself (`split_env`): `STRATA_STAGE_TRIM=1` and
+`STRATA_SPLIT_MIRROR=1`. Without the second one Q4_K_M on a split is **REFUSED** on xe (`STRATA_VERIFY_NO_HOST=1`, so
+the verify path never falls back to the GGUF) - it was a hand-added key in the config before, and a setup rerun would
+have dropped it. `STRATA_MIRROR_MIB` is deliberately left to the engine (its default is `MemAvailable - 4 GiB`; a cap
+smaller than the misses is a REFUSED, not a fallback to the SSD).
+
+Left open:
+
+- `auto` sizes the first stage's cache about **2.16 GiB smaller** than an explicit `--layer-split` does, so the mirror
+  it builds is 11.27 GiB against 9.78 for the same `18 / 25 / 5` (measured twice, identical both times: `expert cache
+  auto: 27.94 GiB free -> 8070 slots` against `30.10 -> 8718`). An explicit split is worth the 1.5 GiB until the
+  difference is explained.
+- The search's *prediction* is still far from the measured window (55.9 ms predicted, ~154 ms measured) even though it
+  now ranks the shapes the right way round. Pricing the last stage's misses harder than the others - they are the ones
+  with nothing behind them - would model this rig better.
+- The port is still without the CUDA twin's **prefill startability gate** (`can_start`, and the `PartStat`/`parts_of`/
+  `chunk_bytes` machinery behind it, `src/program/generate.cpp:3888`) and its **NEAR TIE** recommendation (#1428). The
+  gate drops a placement whose smallest stage cannot lend a 256-token prefill chunk, and only then falls back to the
+  best one with a warning; without it `auto` can pick a placement that fails when a prompt arrives. Separate work.
+- 135K and 200K contexts are not measured on three cards. 131,072 is.

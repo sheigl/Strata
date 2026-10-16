@@ -38,9 +38,19 @@ offers the same steps as tools.
   `gguf_expert_source.cpp`): balanced `--layer-split 24` with `--vram-reserve-mib 1024` runs at 32.2 tok/s (was
   REFUSED). **WS1 (images) done 2026-10-14:** the SYCL port reads pictures through the CPU image encoder
   (`--vision cpu`; 2.4-3.0 s for a 300-token picture, no VRAM used) — see "Images on the SYCL port" in
-  [docs/INTEL.md](docs/INTEL.md); a SYCL build of the encoder is not done. Remaining gap to
-  IQ3_S's 67 tok/s is PCIe mirror drag (21 GiB of experts off-card); the idle B580 (bmg-g21) as a 3rd card is a
-  separate, unscoped project. Designs: [docs/specs/intel-arc-per-stage-mirror.md](docs/specs/intel-arc-per-stage-mirror.md),
+  [docs/INTEL.md](docs/INTEL.md); a SYCL build of the encoder is not done. **WS6 (third card) done 2026-10-15:**
+  the idle B580 joins the pool as expert cache — `--layer-split 18,43`, three stages, measured 26.3 tok/s and a
+  **9.78 GiB** pinned mirror against the pair's 18.1 tok/s and 19.44 GiB on the same prompt (Q4_K_M, 131K; the pair's
+  32.2 tok/s in WS5 is a different, shorter prompt). The B580 takes only the 5 layers whose 2,560 pairs its 8.54 GiB
+  covers completely, because its link is 1.71 GB/s against 13.8/14.0 for the Pros — its verify window then runs a
+  `100% VRAM resident: zero-doorbell graph`. Two engine defects fixed: the port was missing the CUDA engine's
+  per-stage link pricing (`link_scale`), and the measured coverage curve was gated to `ns >= 4`, so 3-GPU `auto`
+  picked `K=2,47` (43.4 GiB mirror, never started inside the 900 s budget) — it now picks `K=18,43` with no
+  environment variable. `setup_intel.py` writes `STRATA_SPLIT_MIRROR=1`/`STRATA_STAGE_TRIM=1` for every split. See
+  "Three cards" in [docs/INTEL.md](docs/INTEL.md) and section 11 of
+  [docs/specs/intel-arc-full-record.md](docs/specs/intel-arc-full-record.md). Remaining gap to IQ3_S's 67 tok/s is
+  PCIe mirror drag; open: the ~2.16 GiB VRAM difference between `auto` and an explicit split, and the B580 as a
+  vision encode card. Designs: [docs/specs/intel-arc-per-stage-mirror.md](docs/specs/intel-arc-per-stage-mirror.md),
   [docs/specs/intel-arc-autosplit-fix.md](docs/specs/intel-arc-autosplit-fix.md).
 
 ## Contributing a change or report
