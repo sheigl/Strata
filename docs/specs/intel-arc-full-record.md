@@ -381,11 +381,15 @@ Mechanism arithmetic, for the record: the streamed read per window ≈ (context 
 measured per-round difference is ~39 ms (78.6 ms a round streamed, 39.8 ms resident), the extra being the 1-5 tokens a
 speculative round verifies.
 
-Caveat, and it is not cosmetic: the two runs' generated text diverged - 164 draft rounds streamed against 143 resident
-for the same 200 output tokens. At temperature 0 (argmax) that means the streamed path is **not numerically identical**
-to the resident one, so its continuation genuinely differs. Whether that is only summation order (different kernels) or
-a lossier representation of the streamed cells is not investigated, and it would be worth knowing before anyone treats
-`--kv-resident` as a pure performance knob.
+Caveat, narrowed on 2026-10-16: the two three-card runs' generated text diverged - 164 draft rounds streamed against 143
+resident for the same 200 output tokens. What is now measured is that the **K/V path itself is bit-transparent**. On the
+pair the whole K/V fits in leftover VRAM, so `--kv-resident` can be changed without touching the expert cache (12,288
+experts / 22.14 GiB in both arms): the same 23 agent turns at one seed, IQ3_S at 200,000, came back **byte-identical**
+resident against streamed, up to a 116,870-token context. That moves the suspect from the K/V path to the **cache
+resize** `--kv-resident 0` forces on three cards - the B70 gives up 332 slots and the B580 83, and those pairs are then
+served from the mirror, a different expert path. It is not proven by a dedicated run, and on three cards the two
+settings cannot be compared bit-for-bit in the first place, because the K/V's VRAM comes out of that cache by
+construction. What is still unanswered: whether the mirror's expert path reproduces the VRAM path's bytes exactly.
 
 This also contradicts the AMD note's "measured flat: `--kv-resident` changes" (docs/AMD_HIP.md:241) - that measurement
 was prompt speed on HIP, where these two runs differ by +34% on the prompt too.
@@ -401,3 +405,58 @@ was prompt speed on HIP, where these two runs differ by +34% on the prompt too.
   nothing is behind them to hide the latency.
 - 135K / 200K context on three cards, and IQ3_S on three cards (its per-stage mirror should not even be needed), are
   unmeasured. The B580 as a *vision encode card* (section 10) is still unbuilt.
+
+## 12. Agent turns: IQ3_S against Q4_K_M, and what the third card is worth (2026-10-16)
+
+Every speed number above is one prompt. This section is the same machine answering **23 real agent turns** - the
+workload in `tools/agent_turns_bench.py`: a repository survey, an expert-cache hunt, a French installer question and a
+French tokenizer question, each sent with the four-tool list an agent gets - replayed at one fixed seed
+(`temperature 1.0`, `top_p 0.95`, `top_k 20`, `reasoning_effort high`, `seed 1234`), 2,199 to 116,870 tokens of
+context, build `0.1.43.1-sycl`. All four runs: `--max-context 200000 --kv int8 --kv-resident 0 --spec 4
+--vram-reserve-mib 1024`, `STRATA_SPLIT_MIRROR=1`, `STRATA_MIRROR_MIB=51200`, and both agent switches on
+(`tool_call_recovery`, `reasoning_close_retry`). Driver and raw evidence: `/tmp/opencode/agent_quality.py`,
+`run_arms.sh`, `agent_quality-<arm>.jsonl`, `agent_quality-<arm>.log` (every reply, under `STRATA_DEBUG=1`).
+
+| arm | layout | expert cache held | mirror | RAM after | decode | prompt | answered | malformed |
+|---|---|---|---|---|---|---|---|---|
+| `q1_iq3s_pair_kv0` | B65 + B70 | 12,288 / 12,288 = 100% | none | 54.1 GiB | **55.9 tok/s** | 583 tok/s | 21/23 | 0 |
+| `q1_iq3s_pair_kv32k` | B65 + B70, `--kv-resident 32768` | 12,288 / 12,288 = 100% | none | 51.7 GiB | 55.2 tok/s | 565 tok/s | 21/23 | 0 |
+| `q1_q4km_pair_kv0` | B65 + B70 | 8,466 / 12,288 = 69% | 21.73 GiB | 31.8 GiB | 24.0 tok/s | 420 tok/s | 20/23 | 0 |
+| `q1_q4km_tri_kv0` | B65 + B70 + B580 | 9,162 / 12,800, then 2,477 / 2,560 | 11.14 GiB | 41.7 GiB | 25.8 tok/s | 421 tok/s | 21/23 | 0 |
+
+"decode" and "prompt" are medians over the 23 turns; "RAM after" is `MemAvailable` with everything loaded, against
+57.9-58.0 GiB before the run. "answered" counts turns that came back with content or a call; the rest are the bench's
+`max_tokens 256` meeting `reasoning_effort high` - the reply is still inside thinking when the cap lands, so there is
+nothing to read. Which turns hit it moved between arms (`server-option.4`, `installer-fr.0/2/3`, `cuda-kernel.0`,
+`expert-cache.3`), so it is a property of the 256-token cap, not of a quant.
+
+**Why Q4_K_M is 2.2x slower here, and it is not the quantizer: IQ3_S fits on the pair and Q4_K_M does not.** IQ3_S's
+experts cost 1.99 MiB a pair (24,481 MiB / 12,288) and its last stage holds 12,288 of 12,288 - the whole MoE for its 24
+layers in VRAM, no mirror built at all, nothing on PCIe in the verify window, 3.8 GiB of RAM. Q4_K_M's cost 3.06 MiB a
+pair, so the same 25 GiB holds 8,466 of 12,288 and every window waits on the mirror for the other 31%: 26.2 GiB of
+pinned RAM, 24.0 tok/s. On this hardware the quantizer is a *fit* decision, not a speed knob.
+
+**The B580 is worth about 7% on agent turns, not the 45% of the single-prompt table.** It holds only its own five
+layers' 2,560 pairs; it cannot enlarge the B70's cache, and the B70's 25 layers are what the head waits on. Coverage
+moves 8,466/12,288 = 68.9% to 9,162/12,800 = 71.6%, about 5% fewer mirror reads a token, and the medians measure 24.0
+against 25.8 tok/s. What it clearly buys is RAM: 21.73 -> 11.14 GiB of mirror, `MemAvailable` 31.8 -> 41.7 GiB, start
+530 -> 430 s. At 116,870 tokens the pair measured *faster* (21.8 against 20.1 tok/s). Read section 11's single-prompt
+18.1 -> 26.3 as a `--kv-resident 32768`, one-prompt result: on this workload the pair row is 24.0, with `--kv-resident
+0` in both. Whether the K/V stream costs more when it shares a link with the expert mirror is untested and is the next
+matched run to make.
+
+**The streamed K/V path is bit-transparent, which narrows section 11's caveat.** Rows 1 and 2 are the same prompts at
+the same seed with the expert cache identical in both (12,288 experts, 22.14 GiB): all **23 replies byte-identical**,
+through a 116,870-token context. So section 11's divergence arrived with the cache resize that `--kv-resident 0` forces
+on three cards (B70 -332 slots, B580 -83, those pairs served from the mirror) - a different expert path, not the K/V
+path. On three cards the two settings cannot be compared bit-for-bit in the first place: the K/V's VRAM comes out of
+that cache by construction. Still unanswered: whether the mirror's expert path reproduces the VRAM path's bytes.
+
+**Quality did not separate the quants on this sample.** In all four arms, all 92 replies: no call left unparsed in the
+content, no bad JSON, no repeated-token run, no empty reply, no English drift on a French turn. Re-parsing every raw
+reply with `tool_call_recovery` off and on gives **23 of 23 identical** in each arm - this workload never writes the
+shapes the switch recovers, so it neither confirms nor contradicts the 92.9% -> 98.3% corpus figure (at 7.1%, 23 clean
+turns is not unlikely; 23 turns bound the rate near 13% and no tighter). The one visible quant difference is *which*
+tool: over the 21 turns IQ3_S answered, Q4_K_M chose the same tool 28 times and a different one on 9 of 42 paired
+comparisons (`grep` against `run` / `read_file` / `list_dir` / `exec` on the same turn). Both are plausible calls for
+those turns, so ranking them needs a judge, which this bench is not.

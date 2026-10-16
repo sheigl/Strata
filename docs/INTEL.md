@@ -988,9 +988,13 @@ tokens the two settings are identical, which is the "fine at first, worse as the
 "measured flat: `--kv-resident` changes" is about *prompt* speed on HIP; here it moves prompt and decode both. The
 staged `strata-swift-q4_k_m-split3.json` uses `--kv-resident 0` at 200,000.
 
-Caveat: the two runs' generated text diverged (different draft counts for the same 200 tokens), so the streamed path is
-not numerically identical to the resident one - at temperature 0 argmax that is enough to change a continuation. Not
-investigated.
+Caveat, narrowed 2026-10-16: the two three-card runs' generated text diverged (different draft counts for the same 200
+tokens). The streamed path itself is bit-transparent - measured on the **pair**, where the whole K/V fits in leftover
+VRAM and the expert cache is the same size in both arms (IQ3_S, 200,000, 12,288 experts / 22.14 GiB either way): the
+same 23 agent turns at one seed came back **byte-identical** with `--kv-resident 0` and `--kv-resident 32768`, up to a
+116,870-token context. So the divergence above came with the **cache resize** `--kv-resident 0` forces on three cards
+(the B70 gives up 332 slots, the B580 83, and those pairs are served from the mirror), not with the K/V path. On three
+cards the two settings cannot be compared bit-for-bit at all: the K/V's VRAM comes out of that cache by construction.
 
 Left open:
 
@@ -1008,3 +1012,29 @@ Left open:
 - 200,000 context is now measured on three cards with the whole K/V resident (above) and with it streamed; 135,168 is
   not, and neither is an intermediate `--kv-resident` (e.g. 131,072 keeps the hot part resident and streams beyond) or
   200,000 on the *pair* with everything resident.
+
+### Agent turns: IQ3_S against Q4_K_M (measured 2026-10-16)
+
+The table above is one prompt. This is 23 **real agent turns** - the requests in `tools/agent_turns_bench.py` (a
+repository survey, an expert-cache hunt, a French installer question, a French tokenizer question), each with an
+agent's tool list - replayed at one seed, 2,199 to 116,870 tokens of context, build `0.1.43.1-sycl`, everything else as
+above with `--kv-resident 0`:
+
+| layout | quant | expert cache held | mirror | RAM after | decode | prompt | answered |
+|---|---|---|---|---|---|---|---|
+| B65 + B70 | IQ3_S | 12,288 / 12,288 = 100% | none | 54.1 GiB | **55.9 tok/s** | 583 tok/s | 21/23 |
+| B65 + B70 | Q4_K_M | 8,466 / 12,288 = 69% | 21.73 GiB | 31.8 GiB | 24.0 tok/s | 420 tok/s | 20/23 |
+| B65 + B70 + B580 | Q4_K_M | 9,162 / 12,800, then 2,477 / 2,560 | 11.14 GiB | 41.7 GiB | 25.8 tok/s | 421 tok/s | 21/23 |
+
+The 2.2x between the quants is **fit, not the quantizer**: IQ3_S's experts are 1.99 MiB a pair against Q4_K_M's 3.06,
+so the pair holds all of IQ3_S's 24,576 pairs in VRAM (no mirror at all, nothing on PCIe in the verify window) and only
+69% of Q4_K_M's, whose windows then wait on the mirror. The B580 is worth about **7%** on this workload, not the 45%
+the single-prompt table shows: it can only hold its own five layers' 2,560 pairs and cannot enlarge the B70's cache,
+which is what the head waits on - coverage 68.9% -> 71.6%. What it clearly buys is RAM: 21.73 -> 11.14 GiB of mirror,
+`MemAvailable` 31.8 -> 41.7 GiB. Speed is unaffected by `--kv-resident` on the pair for IQ3_S (55.9 against 55.2, and
+all 23 replies **byte-identical**, which is what narrows the caveat above to the cache resize). Quality did not
+separate the quants in anything this bench can see: every reply in all four arms was a well-formed call, and re-parsing
+them with `tool_call_recovery` off and on is identical - 23 turns cannot confirm a switch whose corpus rate is 7%.
+Where they differed is *which* tool they called on the same turn (9 of 42 paired comparisons), which needs a judge to
+rank. Details, the raw evidence and the open questions: section 12 of
+[the full record](specs/intel-arc-full-record.md).
