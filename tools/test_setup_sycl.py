@@ -236,6 +236,48 @@ class ToSycl(unittest.TestCase):
             self.assertEqual(c["vision"][key], cfg["vision"][key], key)
 
 
+class SplitEnv(unittest.TestCase):
+    """The environment a layer split gets (sycl/setup_intel.py, split_env): the dense weights are trimmed to one copy
+    (#1980) and each later stage's misses are mirrored in pinned host memory instead of being REFUSED (STRATA_VERIFY_NO_HOST
+    is 1 on xe, so the verify path never falls back to the GGUF).  A 2-card Q4_K_M split cannot start without the
+    second one; a split that misses nothing builds no mirror and pays nothing for it."""
+
+    @staticmethod
+    def mod():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("setup_intel", ROOT / "sycl" / "setup_intel.py")
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def test_a_split_mirrors_its_misses_and_trims_the_dense_weights(self):
+        m = self.mod()
+        env = m.split_env({})
+        self.assertEqual(env["STRATA_STAGE_TRIM"], "1")
+        self.assertEqual(env["STRATA_SPLIT_MIRROR"], "1")
+
+    def test_the_mirror_cap_is_left_to_the_engine(self):
+        """No STRATA_MIRROR_MIB: the engine's default (MemAvailable less 4 GiB) is the machine's own answer, and a cap
+        smaller than the misses is a REFUSED, not a fallback to the SSD."""
+        m = self.mod()
+        self.assertNotIn("STRATA_MIRROR_MIB", m.split_env({}))
+
+    def test_what_earlier_in_the_run_set_is_kept(self):
+        m = self.mod()
+        cfg = {"env": {"STRATA_STAGE_TRIM": "0", "STRATA_SYCL_BIN": "build-sycl/strata"}}
+        env = m.split_env(cfg)
+        self.assertEqual(env["STRATA_STAGE_TRIM"], "0")             # an answer already there wins
+        self.assertEqual(env["STRATA_SYCL_BIN"], "build-sycl/strata")
+        self.assertEqual(env["STRATA_SPLIT_MIRROR"], "1")
+
+    def test_write_run_script_calls_it_for_a_split_and_only_there(self):
+        """The config write_run_script writes is what the server runs, so the split's env has to be added there (and a
+        one-card config must stay exactly what it was)."""
+        src = (ROOT / "sycl" / "setup_intel.py").read_text(encoding="utf-8")
+        self.assertRegex(src, r"if split:\n\s+split_env\(cfg\)\n")
+        self.assertEqual(src.count("split_env("), 2)                # the def and that one call
+
+
 class VisionEncoder(unittest.TestCase):
     """The image encoder on the SYCL port: the CPU one when it is asked for, off for anything else (no SYCL build of
     the encoder exists yet) - and off when nothing was asked for, which is what the port did before."""

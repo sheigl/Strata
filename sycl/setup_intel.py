@@ -135,6 +135,28 @@ def small_card(vram_gb: float, driver: str) -> bool:
     return 0 < vram_gb < SMALL_CARD_GB or driver == "i915"
 
 
+def split_env(cfg: dict) -> dict:
+    """The environment a layer split needs on the SYCL port, written into the config write_run_script returns.  Both
+    keys are setdefault'd, so anything to_sycl already put in the returned env survives; setup owns this file and
+    rewrites it, so a hand-added key has to live here to survive a rerun.
+
+    STRATA_STAGE_TRIM=1 (#1980): without it every card keeps its own copy of the dense weights (1.4 GiB each on
+    Flash-Next IQ3_S) and the load stops at 96-97% resident.
+
+    STRATA_SPLIT_MIRROR=1: a later stage's experts that fit neither its VRAM cache nor the first stage's mirror are
+    REFUSED on the xe driver - STRATA_VERIFY_NO_HOST is 1 there (the GPU cannot page-fault a pageable host buffer),
+    so the verify path never reads the GGUF and the load has nowhere to fall back to.  A quant whose expert blobs are
+    large enough to overflow the later stages' caches hits that on every start: Q4_K_M on the B65 + B70 pair does
+    (1.67 GiB per layer against a ~28 GiB room per card), IQ3_S does not (each stage's cache holds all of its own
+    layers' pairs).  With the flag each stage's misses are mirrored in pinned host memory instead, which is what makes
+    such a load possible at all; a split that misses nothing builds no mirror and the flag costs nothing (the mirror
+    is capped by STRATA_MIRROR_MIB, default MemAvailable - 4 GiB, and a cap smaller than the misses is a REFUSED)."""
+    env = cfg.setdefault("env", {})
+    env.setdefault("STRATA_STAGE_TRIM", "1")
+    env.setdefault("STRATA_SPLIT_MIRROR", "1")
+    return env
+
+
 def sycl_vision_answer(asked) -> str:
     """setup's --vision answer for the SYCL port: the CPU image encoder when it is asked for, images off for anything
     else.  A SYCL (GPU) build of the encoder does not exist yet, so `yes`/`gpu` answer like `no` - the same answer the
@@ -336,9 +358,7 @@ def install(argv) -> None:
             selector = "level_zero:*" if split else f"level_zero:{idx}"
             cfg.setdefault("env", {}).setdefault("ONEAPI_DEVICE_SELECTOR", selector)
         if split:
-            # #1980: without it every card keeps a full copy of the dense weights (1.4 GiB each on Flash-Next IQ2_XS) and the
-            # load stops at 96-97% resident; the later stage's missing experts have no host mirror (STRATA_VERIFY_NO_HOST)
-            cfg.setdefault("env", {}).setdefault("STRATA_STAGE_TRIM", "1")
+            split_env(cfg)
         need = S.MODELS.get(model, {}).get("ram_gb", 0)
         sel_alch = sel["driver"] == "i915" or sel.get("devid") in ALCHEMIST_IDS
         if sel_alch and need and real_ram < need:
