@@ -962,6 +962,36 @@ the verify path never falls back to the GGUF) - it was a hand-added key in the c
 have dropped it. `STRATA_MIRROR_MIB` is deliberately left to the engine (its default is `MemAvailable - 4 GiB`; a cap
 smaller than the misses is a REFUSED, not a fallback to the SSD).
 
+### Long context: the K/V streaming cliff at 200,000 (measured 2026-10-15)
+
+`--kv-resident 32768` - the convention in the AMD docs and in the live Intel configs - keeps only the most recent
+32,768 K/V cells in VRAM. The rest live in pinned host RAM and are read **inside every attention**, so the cost grows
+linearly with context and sits on the critical path of every verify round and of prefill. The same three-card layout
+at 200,000 context, one 88,949-token prompt, then 200 tokens out:
+
+| | `--kv-resident 32768` | `--kv-resident 0` (whole K/V in VRAM) |
+|---|---|---|
+| 68-token prompt, decode | 26.2 tok/s | 25.9 tok/s |
+| 88,949-token prompt read | 763.9 tok/s (116.4 s) | **1,026.1 tok/s** (86.7 s) |
+| decode at 89K context | **15.5 tok/s** | **35.2 tok/s** |
+| drafts accepted at 89K | 114 / 164 | 115 / 143 |
+| agentic turn (81,920 reused + 7,036 read) | not run | 12.5 s, **32.9 tok/s** |
+| mirror | 9.85 GiB | 11.14 GiB |
+| K/V in pinned RAM | 0.79 GiB | 0 |
+| net pinned | 10.64 GiB | 11.14 GiB |
+| start | 350 s | 520 s |
+| B580 coverage | 2,560 / 2,560 | 2,477 / 2,560 |
+
+The whole 200,000-cell K/V costs about 1.3 GiB of VRAM (the B70 gives up 332 cache slots, the B580 83 - so 83 of its
+pairs move to the mirror) and returns 2.3x the decode rate at 89K tokens for 0.5 GiB more net pinned RAM. Below 32,768
+tokens the two settings are identical, which is the "fine at first, worse as the workflow grows" shape. The AMD doc's
+"measured flat: `--kv-resident` changes" is about *prompt* speed on HIP; here it moves prompt and decode both. The
+staged `strata-swift-q4_k_m-split3.json` uses `--kv-resident 0` at 200,000.
+
+Caveat: the two runs' generated text diverged (different draft counts for the same 200 tokens), so the streamed path is
+not numerically identical to the resident one - at temperature 0 argmax that is enough to change a continuation. Not
+investigated.
+
 Left open:
 
 - `auto` sizes the first stage's cache about **2.16 GiB smaller** than an explicit `--layer-split` does, so the mirror
@@ -975,4 +1005,6 @@ Left open:
   `chunk_bytes` machinery behind it, `src/program/generate.cpp:3888`) and its **NEAR TIE** recommendation (#1428). The
   gate drops a placement whose smallest stage cannot lend a 256-token prefill chunk, and only then falls back to the
   best one with a warning; without it `auto` can pick a placement that fails when a prompt arrives. Separate work.
-- 135K and 200K contexts are not measured on three cards. 131,072 is.
+- 200,000 context is now measured on three cards with the whole K/V resident (above) and with it streamed; 135,168 is
+  not, and neither is an intermediate `--kv-resident` (e.g. 131,072 keeps the hot part resident and streams beyond) or
+  200,000 on the *pair* with everything resident.

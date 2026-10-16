@@ -347,6 +347,49 @@ The B65 covers 18 of its own layers completely (9,216 slots / 9,216 pairs); the 
 9,518 of 12,800 = 74%, and its 3,282 missing pairs are the 9.78 GiB mirror. Total held 21,301 of 24,576, the ceiling
 for these three cards at this context.
 
+### The K/V streaming cliff at 200,000 context (measured 2026-10-15)
+
+The user's own reason for wanting three cards is quality: IQ3_S "did great at first but really started to suffer after
+long workflows" at 200K, so Q4_K_M has to be usable there. Measuring Q4_K_M at 200,000 on the 18/25/5 layout turned up
+a cliff that has nothing to do with the card count: `--kv-resident 32768` keeps only the newest 32,768 K/V cells in
+VRAM and streams the rest from pinned host RAM, and the streaming read happens **inside every attention** - once per
+verified token in a window, and once per chunk in prefill. Past 32,768 tokens the cost grows linearly with the context
+and lands on the critical path. Same build, same day, same 88,949-token prompt, then 200 tokens out:
+
+| | `--kv-resident 32768` | `--kv-resident 0` (whole K/V in VRAM) |
+|---|---|---|
+| 68-token prompt, decode | 26.2 tok/s | 25.9 tok/s |
+| 88,949-token prompt read | 763.9 tok/s (116.4 s) | **1,026.1 tok/s** (86.7 s) |
+| decode at 89K context | **15.5 tok/s** (200 in 12.90 s) | **35.2 tok/s** (200 in 5.69 s) |
+| drafts accepted at 89K | 114 / 164 | 115 / 143 |
+| agentic turn (same context + instruction: 81,920 reused, 7,036 read) | not run | 12.5 s read, 32.9 tok/s out |
+| mirror | 9.85 GiB | 11.14 GiB |
+| K/V in pinned RAM | 0.79 GiB | 0 |
+| net pinned host | 10.64 GiB | 11.14 GiB |
+| start to READY | 350 s | 520 s |
+| B580 coverage | 2,560 / 2,560 | 2,477 / 2,560 |
+
+The whole 200,000-cell K/V is worth about **1.3 GiB of VRAM**: the B70's cache gives up 332 slots (9,494 -> 9,162) and
+the B580 83 (2,560 -> 2,477, so 83 of its pairs move to the mirror on its 1.71 GB/s link), and the mirror grows
+9.85 -> 11.14 GiB. Net pinned RAM rises 0.5 GiB. That buys 2.3x the decode rate at 89K tokens, +34% on the prompt
+read, and it is what makes a long agentic turn (81,920 reused + 7,036 read + 200 out) finish in 18.6 s instead of
+minutes. Below 32,768 tokens the two settings are identical - exactly the "great at first, suffers after long
+workflows" shape the user described.
+
+Mechanism arithmetic, for the record: the streamed read per window ≈ (context − 32,768) cells x bytes x QSA layers. At
+89K that is ~0.27 GiB per verified token over the B580's or B70's link, which at 13.8 GB/s is 19 ms a token - and the
+measured per-round difference is ~39 ms (78.6 ms a round streamed, 39.8 ms resident), the extra being the 1-5 tokens a
+speculative round verifies.
+
+Caveat, and it is not cosmetic: the two runs' generated text diverged - 164 draft rounds streamed against 143 resident
+for the same 200 output tokens. At temperature 0 (argmax) that means the streamed path is **not numerically identical**
+to the resident one, so its continuation genuinely differs. Whether that is only summation order (different kernels) or
+a lossier representation of the streamed cells is not investigated, and it would be worth knowing before anyone treats
+`--kv-resident` as a pure performance knob.
+
+This also contradicts the AMD note's "measured flat: `--kv-resident` changes" (docs/AMD_HIP.md:241) - that measurement
+was prompt speed on HIP, where these two runs differ by +34% on the prompt too.
+
 ### Open
 
 - `auto` leaves the first stage **2.16 GiB less** free VRAM than an explicit `--layer-split` with the same K

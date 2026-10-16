@@ -46,8 +46,11 @@ offers the same steps as tools.
   `100% VRAM resident: zero-doorbell graph`. Two engine defects fixed: the port was missing the CUDA engine's
   per-stage link pricing (`link_scale`), and the measured coverage curve was gated to `ns >= 4`, so 3-GPU `auto`
   picked `K=2,47` (43.4 GiB mirror, never started inside the 900 s budget) — it now picks `K=18,43` with no
-  environment variable. `setup_intel.py` writes `STRATA_SPLIT_MIRROR=1`/`STRATA_STAGE_TRIM=1` for every split. See
-  "Three cards" in [docs/INTEL.md](docs/INTEL.md) and section 11 of
+  environment variable. `setup_intel.py` writes `STRATA_SPLIT_MIRROR=1`/`STRATA_STAGE_TRIM=1` for every split. **Long
+  context, measured 2026-10-15:** at 200,000 context `--kv-resident 0` (the whole K/V in VRAM, ~1.3 GiB) decodes at
+  **35.2 tok/s** with 89K tokens of context behind it against 15.5 tok/s for the `--kv-resident 32768` the live configs
+  and the AMD docs use, and reads an 88,949-token prompt at 1,026 against 764 tok/s; the mirror grows 9.85 → 11.14 GiB
+  for +0.5 GiB net pinned RAM. See "Long context" and "Three cards" in [docs/INTEL.md](docs/INTEL.md) and section 11 of
   [docs/specs/intel-arc-full-record.md](docs/specs/intel-arc-full-record.md). Remaining gap to IQ3_S's 67 tok/s is
   PCIe mirror drag; open: the ~2.16 GiB VRAM difference between `auto` and an explicit split, and the B580 as a
   vision encode card. Designs: [docs/specs/intel-arc-per-stage-mirror.md](docs/specs/intel-arc-per-stage-mirror.md),
