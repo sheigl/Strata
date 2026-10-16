@@ -3560,6 +3560,28 @@ int main(int argc, char **argv) try {
                                  "%.2f GiB free before its session carve\n", dev, sms, khz / 1e6, layer_ms[(size_t) i],
                          (double) cap[(size_t) i] / 1073741824.0);
         }
+        // The per-stage link, as the CUDA engine prices it (src/program/generate.cpp:3717).  A stage whose link is
+        // slower than the others misses more dearly per byte, and the search has to know: on a B65 + B70 + B580 the
+        // two Arc Pros read host memory at ~13.8 GB/s and the B580 at 1.71 (measured here, both directions), so a
+        // miss on the B580 costs ~8x a miss on either Pro.  Without this the search is blind to the link and hands
+        // the slow card layers its cache cannot hold: with the coverage curve on but this missing, 3-GPU auto picked
+        // K=15,41 (B65 15 / B70 26 / B580 7 - 3,584 pairs against the B580's 2,560-slot cache); with it, the same
+        // search picks K=18,43, where the B580 holds 2,560 of 2,560 of its own pairs and no miss touches its link.
+        // These probes read a *pinned* source, as the port's stage probes already do (its DMA path is pinned since
+        // 0.1.41); the CUDA twin reads a pageable one, so its absolute numbers are lower - the ratio between stages,
+        // which is all the search uses, is the same.
+        std::vector<double> link_scale((size_t) ns, 1.0);
+        for (int i = 0; i < ns; ++i) {
+            const int dev = i == 0 ? 0 : stages[(size_t) i - 1]->dev;
+            const strata::core::OnDevice on(dev);
+            std::string bursts;
+            const double bw = native_pack ? probe_pcie_h2d_gbps(&bursts, true) : -1.0;
+            // Never below 1.0: a link at or above the 20 GB/s reference keeps the fitted cost exactly (a x16
+            // gen4/5 reads 26-28 and must not credit misses below the formula the sweep's K was fitted with).
+            if (bw > 0.0) link_scale[(size_t) i] = std::clamp(20.0 / bw, 1.0, 64.0);
+            std::fprintf(stderr, "strata generate: layer split auto: CUDA%d link %.1f GB/s -> miss cost x%.2f\n",
+                         dev, bw, link_scale[(size_t) i]);
+        }
         const double miss_ms = std::getenv("STRATA_SPLIT_MISS_MS") ? std::atof(std::getenv("STRATA_SPLIT_MISS_MS")) : 190.0;
         // ---- THE COVERAGE CURVE: HOW MUCH ROUTED MASS A CACHE HOLDS, AND WHY IT IS NO LONGER A POWER LAW.
         //
@@ -3589,10 +3611,15 @@ int main(int argc, char **argv) try {
         const double cover_b = std::getenv("STRATA_SPLIT_COVER_B") ? std::atof(std::getenv("STRATA_SPLIT_COVER_B")) : 3.0;
         std::vector<double> mass(n_ranked);
         double total_mass = 0;
-        // Up to 3 GPUs the 0.1.39 curve (r+1)^-1.2 is kept, so 2- and 3-GPU placements do not move (the new curve is a
-        // fit to a 4-way rig and was not measured on them); STRATA_SPLIT_COVER_B asks for the coverage curve at any
-        // GPU count.
-        const bool coverage_curve = ns >= 4 || std::getenv("STRATA_SPLIT_COVER_B") != nullptr;
+        // A 2-GPU placement keeps the 0.1.39 curve (r+1)^-1.2, so it does not move: the new curve is a fit to a 4-way
+        // rig and a pair splits evenly anyway.  A 3-GPU split used to keep it too, and that is the regime where it is
+        // most wrong, because three cards hold a *smaller* share of the profile between them than four do.  Measured on
+        // B65 + B70 + B580 (Q4_K_M, 131,072 context, 2026-10-15): the power law still claimed a 44%-full profile held
+        // 97.5% of the routed mass, so `auto` left the B65 at 2 layers and put 45 on the B70 - 14,286 experts unheld,
+        // a 43.4 GiB mirror, 561 s to build, past the server's 900 s start budget: the model never started.  With this
+        // curve the same search picks K=18,43, which measures 26.3 tok/s and a 9.78 GiB mirror against the pair's
+        // 18.1 tok/s and 19.44 GiB.  STRATA_SPLIT_COVER_B overrides b at any GPU count.
+        const bool coverage_curve = ns >= 3 || std::getenv("STRATA_SPLIT_COVER_B") != nullptr;
         for (size_t r = 0; r < n_ranked; ++r) {
             if (!coverage_curve) {
                 total_mass += (mass[r] = std::pow((double) r + 1.0, -1.2));
@@ -3619,19 +3646,26 @@ int main(int argc, char **argv) try {
             std::fill(used.begin(), used.end(), 0);
             held_mass = 0;
             held = 0;
+            std::vector<double> mass_i((size_t) ns, 0.0), held_i((size_t) ns, 0.0);
             std::vector<bool> full((size_t) ns, false);
             for (size_t r = 0; r < profile.size(); ++r) {
                 const int64_t l = profile[r].first;
                 int st = 0;
                 while (st + 1 < ns && l >= at[(size_t) st]) ++st;
+                mass_i[(size_t) st] += mass[r];
                 if (full[(size_t) st]) continue;
                 if (used[(size_t) st] + cost(l) > capr[(size_t) st]) { full[(size_t) st] = true; continue; }   // as the fill
                 used[(size_t) st] += cost(l);
                 held_mass += mass[r];
+                held_i[(size_t) st] += mass[r];
                 ++held;
             }
             held_mass /= std::max(total_mass, 1e-9);
-            double ms = miss_ms * (1.0 - held_mass);
+            // Each stage's misses on its own link (link_scale; 1.0 everywhere = the fitted single-constant formula).
+            double ms = 0.0;
+            for (int i = 0; i < ns; ++i)
+                ms += miss_ms * link_scale[(size_t) i] * std::max(0.0, mass_i[(size_t) i] - held_i[(size_t) i]) /
+                      std::max(total_mass, 1e-9);
             for (int i = 0; i < ns; ++i) {
                 const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
                 ms += (double) (le - lb) * layer_ms[(size_t) i];
