@@ -77,9 +77,9 @@ Terminal cannot run. Strata's MCP server ([docs/MCP_SERVER.md](docs/MCP_SERVER.m
   validated at 115,959 tokens read). **WS5 done:** Q4_K_M admitted to setup and now **serves on the pair**
   via the new per-stage host mirror (`STRATA_SPLIT_MIRROR=1`, `sycl/src/program/generate.cpp` +
   `gguf_expert_source.cpp`): balanced `--layer-split 24` with `--vram-reserve-mib 1024` runs at 32.2 tok/s (was
-  REFUSED). **WS1 (images) done 2026-10-14:** the SYCL port reads pictures through the CPU image encoder
-  (`--vision cpu`; 2.4-3.0 s for a 300-token picture, no VRAM used) — see "Images on the SYCL port" in
-  [docs/INTEL.md](docs/INTEL.md); a SYCL build of the encoder is not done. **WS6 (third card) done 2026-10-15:**
+  REFUSED). **WS1 (images) was done 2026-10-14** by a CPU image encoder of our own (`--vision cpu`; 2.4-3.0 s for a
+  300-token picture, no VRAM used); **v0.2.2 replaces it** with the portable CPU reader `strata-vision` and a SYCL
+  reader, both setup's own steps — see "Pictures on an Arc" in [docs/INTEL.md](docs/INTEL.md). **WS6 (third card) done 2026-10-15:**
   the idle B580 joins the pool as expert cache — `--layer-split 18,43`, three stages, measured 26.3 tok/s and a
   **9.78 GiB** pinned mirror against the pair's 18.1 tok/s and 19.44 GiB on the same prompt (Q4_K_M, 131K; the pair's
   32.2 tok/s in WS5 is a different, shorter prompt). The B580 takes only the 5 layers whose 2,560 pairs its 8.54 GiB

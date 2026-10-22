@@ -23,7 +23,7 @@ PCIe 3.0 x8 slot (the card trains at Gen3 x8 there; it can do Gen5 x16).
 | decode, Coder IQ1_M | 44-51 tok/s on an RTX 5070 | **78.2 tok/s** (19-token prompt, 256 greedy tokens), **75.7** after a 2,184-token prompt, 69 after 40K, 66.6 after 128K, 55.9 after 256K; 48-72 through the API | 23-25 tok/s |
 | prompt reading | ~1,870 tok/s | **790 tok/s** at 2,184 tokens, 1,117 at 40K, 888 at 128K, 757 at 256K | ~150 tok/s (424 at 105K) |
 | speculative decoding (MTP) | yes | yes (the base checkpoint's draft layer; 70-85% of drafts accepted on code) | no |
-| images | yes | yes, read on the CPU (see "Images on the SYCL port") | not yet |
+| images | yes | yes on Alchemist, off by default on Battlemage; read on the CPU by the portable reader, or on the card with `--vision gpu` (see "Pictures on an Arc") | not yet |
 | context | up to 262K | 256K measured, 56 tok/s decode there (`--kv-resident`: the KV in pinned host memory, the attended window in VRAM) | 131K measured ceiling |
 
 Decode speed with speculative decoding depends on the text: code drafts well, prose less so (see "Speed depends
@@ -61,14 +61,18 @@ questions are setup's own. What changes:
   path, the one that builds locally.
 - **Engine step:** it uses the SYCL build (`build-sycl-aot/strata` or `build-sycl/strata`, run in the `strata-sycl-dev`
   image by `sycl/serve/strata-sycl.sh`) instead of compiling CUDA or HIP.
-- **Image encoder:** `--vision cpu` builds setup's CPU encoder (`tools/vision` without CUDA) and puts it beside the SYCL
-  engine; a picture is read by the CPU and only its embeddings reach the engine. Nothing asked for means images off,
-  and `--vision gpu` says there is no GPU encoder for this port and leaves them off (see "Images on the SYCL port").
+- **Image encoder:** setup compiles the portable CPU reader (`strata-vision`, llama.cpp's mtmd, the same program the AMD
+  packages carry) into `engine-sycl/`, the server runs it on the host, and the engine in the container reads the
+  embeddings from the shared `/dev/shm`. Pictures are on for an Alchemist card and off by default on a Battlemage one
+  (the Arc Pro B70 fault); `--vision no` is the off switch and `--vision gpu` builds the SYCL reader when the oneAPI
+  compiler is on the PC (see "Pictures on an Arc").
 - **RAM rule:** this does not apply on an `xe` card. The CUDA engine keeps every expert in RAM; the port streams them from
   the GGUF into VRAM (`--stream-experts`), so RAM only decides the KV streaming. `--check` lists what fits by VRAM.
 - **The config:** it uses the container's paths and `"backend": "sycl"`. The VRAM reserve is 1,024 MiB up to
   32K and 2,048 MiB with 4,096-token prompt chunks above that, 300 MiB on a card under 12 GB; a
-  `--vram-reserve-mib N` you give is kept as given. KV streaming (`--kv-resident 32768`) is on from
+  `--vram-reserve-mib N` you give is kept as given. The prompt chunk is 4,096 tokens, and 8,192 on a Battlemage
+  card of 24 GB or more over a 32K context, where the prompt borrows cache slots (10-16% faster on 16K-32K prompts;
+  "Arc Pro B70: `--prefill 8192`" below). KV streaming (`--kv-resident 32768`) is on from
   64K up when the RAM holds the KV. A `model_switcher` or `sampling` block from an earlier config is kept.
   `run-<model>.sh` starts `sycl/serve/server_intel.py`.
 - **Arc A-series (`i915`, e.g. the A750 with 8 GB):** a different config, see "Arc A750 and the other Alchemist cards" below.
