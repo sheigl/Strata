@@ -5007,12 +5007,17 @@ int main(int argc, char **argv) try {
     // over PCIe (--stream-experts has no host copy otherwise: each routed miss was an SSD read). The share of misses
     // the GPU takes is --pcie-frac; STRATA_MIRROR_MIB caps the mirror (default: MemAvailable less 4 GiB), 0 = off.
     unsigned long long* mirror_table_d = nullptr;   // [n_layers][n_expert] device-readable mirror addresses (0 = none)
+    uint64_t mirror_cap_bytes = 0;                  // the budget the mirror was built against (STRATA_MIRROR_ADAPT adopts against it)
     int64_t unmirrored_misses = 0;
     // STRATA_SPLIT_MIRROR (opt-in, default off): on a multi-GPU layer split, defer the mirror build to after the
     // stage caches exist and give EVERY stage its own mirror (below, after the stage loop) instead of the
     // first-stage-only mirror here.  Off (or single-GPU): this block runs exactly as it always has.
     const bool split_mirror = [] { const char* v = std::getenv("STRATA_SPLIT_MIRROR"); return v && *v && std::strcmp(v, "0") != 0; }();
     const bool defer_mirror = split_mirror && multi_gpu;
+    // STRATA_MIRROR_ADAPT=1 (opt-in): keep the adaptive expert tier on under STRATA_VERIFY_NO_HOST by adopting each
+    // swapped-out expert into the pinned mirror first (D2H from its slot, ahead of the overwrite; the cap is the
+    // mirror's own). Off: the tier is turned off at the start exactly as before.
+    const bool mirror_adapt = [] { const char* v = std::getenv("STRATA_MIRROR_ADAPT"); return v && *v && std::strcmp(v, "0") != 0; }();
     if (o.stream_experts && srcp == &gguf_src && o.expert_cache > 0 && !defer_mirror) {
         // #1054, #1440: with a layer split the mirror holds only the first GPU's layers. The pinned memory belongs to
         // this GPU's context, and the later stages' caches do not exist yet (every later-stage expert would count as a
@@ -5055,6 +5060,7 @@ int main(int argc, char **argv) try {
         }
         const char* mv = std::getenv("STRATA_MIRROR_MIB");
         const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        mirror_cap_bytes = cap;
         if (!miss.empty() && cap > 0) {
             const auto tm = Clock::now();
             const int64_t got = gguf_src.mirror(miss, cap, 8, err);
@@ -5088,12 +5094,17 @@ int main(int argc, char **argv) try {
         }
         // The same rule after the start: the mirror holds the start's misses only, so an expert an adaptive swap moves
         // out of VRAM would be in neither, and the device plan would wait for a host that never serves it (every token
-        // 0 after a --batch window had counted misses and the tier swapped).
-        if (!miss.empty() && no_host && o.adapt_every > 0 && o.adapt_swaps > 0) {
+        // 0 after a --batch window had counted misses and the tier swapped). STRATA_MIRROR_ADAPT=1 closes the hole the
+        // other way: the swap-out is adopted into the mirror first, and the tier stays on.
+        if (!miss.empty() && no_host && o.adapt_every > 0 && o.adapt_swaps > 0 && !mirror_adapt) {
             std::fprintf(stderr, "strata generate: adaptive swaps off: with STRATA_VERIFY_NO_HOST an expert they move out of "
-                                 "VRAM would be neither there nor mirrored\n");
+                                 "VRAM would be neither there nor mirrored (STRATA_MIRROR_ADAPT=1 adopts swap-outs into the "
+                                 "mirror and keeps the tier on)\n");
             o.adapt_every = 0;
         }
+        if (!miss.empty() && no_host && mirror_adapt && o.adapt_every > 0 && o.adapt_swaps > 0)
+            std::fprintf(stderr, "strata generate: STRATA_MIRROR_ADAPT=1: the adaptive tier stays on under STRATA_VERIFY_NO_HOST; "
+                                 "each swap-out is adopted into the pinned mirror first (cap STRATA_MIRROR_MIB)\n");
     }
 
     for (auto& stp : stages) {
@@ -5216,6 +5227,7 @@ int main(int argc, char **argv) try {
         }
         const char* mv = std::getenv("STRATA_MIRROR_MIB");
         const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        mirror_cap_bytes = cap;
         uint64_t total_miss = 0;
         for (int s = 0; s < n_stages_m; ++s) total_miss += sbytes[(size_t) s];
         if (cap > 0 && total_miss > 0) {
@@ -5299,6 +5311,22 @@ int main(int argc, char **argv) try {
                                  "each card's duplicate dense weights, lower --max-context or --vram-reserve-mib, or unset "
                                  "STRATA_VERIFY_NO_HOST\n", (long long) later_misses);
             refuse_exit(2);
+        }
+        // The deferred path's version of the single-table rule above: the mirror covers the START's misses; an
+        // expert the adaptive tier evicts later was resident at the start and is in no mirror, so under
+        // STRATA_VERIFY_NO_HOST the device plan would have nothing to read for it. STRATA_MIRROR_ADAPT=1 keeps the
+        // tier on by adopting each swap-out into the mirror first; off, the tier is off, as the single-table path
+        // has always had it.
+        if (defer_mirror && later_misses > 0 && no_host_split && o.adapt_every > 0 && o.adapt_swaps > 0) {
+            if (mirror_adapt) {
+                std::fprintf(stderr, "strata generate: STRATA_MIRROR_ADAPT=1: the adaptive tier stays on under STRATA_VERIFY_NO_HOST; "
+                                     "each swap-out is adopted into the pinned mirror first (cap STRATA_MIRROR_MIB)\n");
+            } else {
+                std::fprintf(stderr, "strata generate: adaptive swaps off: with STRATA_VERIFY_NO_HOST an expert they move out of "
+                                     "VRAM would be neither there nor mirrored (STRATA_MIRROR_ADAPT=1 adopts swap-outs into the "
+                                     "mirror and keeps the tier on)\n");
+                o.adapt_every = 0;
+            }
         }
         if (later_misses > 0 && !defer_mirror)
             std::fprintf(stderr, "strata generate: layer split: %lld experts of the later stages are not in VRAM (served by the host)\n",
@@ -8168,6 +8196,10 @@ int main(int argc, char **argv) try {
         std::vector<std::pair<int32_t, int32_t>> pending;
         int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
+        // STRATA_MIRROR_ADAPT: the adopted swap-outs' mirror-table entries, published when the round's copies have
+        // landed (the alias is a value; the write is a synchronous memcpy on the then-idle stream)
+        struct AdoptPub { unsigned long long* tab; size_t idx; unsigned long long alias; dpct::queue_ptr q; };
+        std::vector<AdoptPub> adopt_pending;
         dpct::event_ptr adapt_ev = nullptr;
         adapt_ev = new sycl::event();
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
@@ -8204,6 +8236,9 @@ int main(int argc, char **argv) try {
                 }
             for (auto& st : stages) st->adapt_live = false;
             unpin_blobs(pin_live);
+            for (const auto& ap : adopt_pending)   // the round's copies landed: the refill streams are idle
+                ap.q->memcpy(ap.tab + ap.idx, &ap.alias, sizeof(ap.alias)).wait();
+            adopt_pending.clear();
             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
             for (const auto& [i, slot] : pending) {
                 host_res[(size_t) i] = slot;
@@ -8259,6 +8294,42 @@ int main(int argc, char **argv) try {
                 return {&xcache, adapt_stream, -1};
             };
             if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, home_of)) return false;
+            // STRATA_MIRROR_ADAPT=1: under STRATA_VERIFY_NO_HOST a swapped-out expert would leave the device plan
+            // nothing to read. Adopt each victim's bytes into the pinned mirror from its slot, ahead of the
+            // overwrite on the same in-order refill stream; the alias goes into the owning stage's mirror table
+            // when the round's copies have landed (apply_pending). A victim the cap has no room for keeps its
+            // slot: its swap drops out of the round.
+            if (mirror_adapt && !swaps.empty()) {
+                std::vector<Swap> adoptable;
+                adoptable.reserve(swaps.size());
+                for (const Swap& s : swaps) {
+                    if (gguf_src.pinned(s.layer, s.out)) { adoptable.push_back(s); continue; }
+                    const int stn = multi_gpu ? stage_of(s.layer) : 0;
+                    GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
+                    unsigned long long* tab = stage_mirror.empty() ? mirror_table_d : stage_mirror[(size_t) stn];
+                    const int32_t slot = host_res[(size_t) s.layer * g.n_expert + s.out];
+                    if (slot < 0 || tab == nullptr) continue;   // cannot publish: the victim stays resident
+                    const strata::core::OnDevice on(gs ? gs->dev : -1);
+                    auto& q = gs ? *gs->adapt_stream : *adapt_stream;
+                    std::string aerr;
+                    const uint8_t* alias = gguf_src.adopt(s.layer, s.out,
+                                                          (gs ? gs->cache : xcache).device_slot(slot),
+                                                          (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                                                          mirror_cap_bytes, q, aerr);
+                    if (alias == nullptr) {
+                        static int64_t spent_note = 0;
+                        if (spent_note++ == 0)
+                            std::fprintf(stderr, "strata serve: STRATA_MIRROR_ADAPT: %s; later rounds swap already-mirrored victims only\n",
+                                         aerr.c_str());
+                        continue;
+                    }
+                    adopt_pending.push_back({tab, (size_t) s.layer * g.n_expert + s.out, (unsigned long long) alias,
+                                             gs ? gs->adapt_stream : adapt_stream});
+                    if (gs) gs->adapt_live = true;
+                    adoptable.push_back(s);
+                }
+                swaps.swap(adoptable);
+            }
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;
                 for (const Swap& s : swaps)
@@ -12611,6 +12682,10 @@ int main(int argc, char **argv) try {
         std::vector<std::pair<int32_t, int32_t>> pending;
         int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
+        // STRATA_MIRROR_ADAPT: the adopted swap-outs' mirror-table entries, published when the round's copies have
+        // landed (the same rule the serve path above has)
+        struct AdoptPub { unsigned long long* tab; size_t idx; unsigned long long alias; dpct::queue_ptr q; };
+        std::vector<AdoptPub> adopt_pending;
         dpct::event_ptr adapt_ev = nullptr;
         adapt_ev = new sycl::event();
         int64_t adapt_rounds = 0;   // counted here: `rounds` is declared below the adapt lambda
@@ -12631,6 +12706,9 @@ int main(int argc, char **argv) try {
             if (trace_pending)
                 std::fprintf(stderr, "strata: PENDING landed, %zu experts become resident\n", pending.size());
             unpin_blobs(pin_live);
+            for (const auto& ap : adopt_pending)   // the round's copies landed: the refill stream is idle
+                ap.q->memcpy(ap.tab + ap.idx, &ap.alias, sizeof(ap.alias)).wait();
+            adopt_pending.clear();
             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
             for (const auto& [i, slot] : pending) {
                 host_res[(size_t) i] = slot;
@@ -12693,6 +12771,33 @@ int main(int argc, char **argv) try {
                                       [&](int64_t) -> SwapHome { return {&xcache, adapt_stream, -1}; })) {
                 std::fprintf(stderr, "strata generate: an adaptive refill failed (copying evicted experts back)\n");
                 return false;
+            }
+            // STRATA_MIRROR_ADAPT=1: adopt each swap-out's bytes into the pinned mirror from its slot, ahead of the
+            // overwrite on the same in-order stream, and publish the alias in the mirror table - the same rule the
+            // serve path above has. A victim the cap has no room for keeps its slot.
+            if (mirror_adapt && !swaps.empty()) {
+                std::vector<Swap> adoptable;
+                adoptable.reserve(swaps.size());
+                for (const Swap& s : swaps) {
+                    if (gguf_src.pinned(s.layer, s.out)) { adoptable.push_back(s); continue; }
+                    const int32_t slot = host_res[(size_t) s.layer * g.n_expert + s.out];
+                    if (slot < 0 || mirror_table_d == nullptr) continue;
+                    std::string aerr;
+                    const uint8_t* alias = gguf_src.adopt(s.layer, s.out, xcache.device_slot(slot),
+                                                          (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                                                          mirror_cap_bytes, *adapt_stream, aerr);
+                    if (alias == nullptr) {
+                        static int64_t spent_note = 0;
+                        if (spent_note++ == 0)
+                            std::fprintf(stderr, "strata generate: STRATA_MIRROR_ADAPT: %s; later rounds swap already-mirrored victims only\n",
+                                         aerr.c_str());
+                        continue;
+                    }
+                    adopt_pending.push_back({mirror_table_d, (size_t) s.layer * g.n_expert + s.out,
+                                             (unsigned long long) alias, adapt_stream});
+                    adoptable.push_back(s);
+                }
+                swaps.swap(adoptable);
             }
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;

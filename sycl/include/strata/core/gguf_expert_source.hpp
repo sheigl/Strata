@@ -22,6 +22,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace sycl { inline namespace _V1 { class queue; } }   // adopt()'s copy stream; the definition comes with the includer's SYCL headers
+
 namespace strata::core {
 
 class GgufExpertSource : public ExpertSource {
@@ -49,6 +51,14 @@ public:
     /// routed - what made decode collapse to 4-5 tok/s at 256K (docs/INTEL.md). At most `cap` bytes; returns the
     /// number mirrored. Threads read in parallel.
     int64_t mirror(const std::vector<std::pair<int64_t, int64_t>>& pairs, uint64_t cap, int threads, std::string& err);
+    /// STRATA_MIRROR_ADAPT (opt-in): adopt one expert's blob into the mirror from a device pointer (a cache slot
+    /// about to be overwritten by an adaptive swap). The D2H copy is queued on `q`, in-order with the overwrite that
+    /// follows it on the same stream; the bytes are the slot's own, so a later mirror read is byte-identical to the
+    /// GGUF's. Returns the device alias to publish in the mirror table, nullptr when the cap (`cap_bytes`, the same
+    /// budget `mirror()` was given) has no room or the allocation failed - `err` says which. An already-pinned
+    /// expert returns its alias and copies nothing.
+    const uint8_t* adopt(int64_t layer, int64_t expert, const void* dev_src, size_t bytes, uint64_t cap_bytes,
+                         sycl::queue& q, std::string& err);
     bool pinned(int64_t layer, int64_t expert) const override;
     /// The mirrored blob's address, which the device can read. For a layer that has any mirrored expert, an
     /// unmirrored one answers that layer's first mirrored blob: the verify plan asks `device_alias(layer, 0)` only as
@@ -73,6 +83,8 @@ private:
     int64_t reads_ = 0;
     std::vector<uint8_t*> mirror_chunks_;          ///< USM host (pinned, device-readable); several chunks: Alchemist
                                                    ///< (Arc A-series) refuses a single host allocation past ~3 GiB
+    uint8_t* adopt_cur_ = nullptr;                 ///< STRATA_MIRROR_ADAPT: the open adopt chunk and its fill
+    uint64_t adopt_off_ = 0, adopt_size_ = 0;
     uint64_t mirror_bytes_ = 0;
     std::vector<uint8_t*> mirror_ptr_;             ///< per (layer, expert): its blob in the chunks, null = not mirrored
     std::vector<const uint8_t*> layer_first_;      ///< per layer: its first mirrored blob, null = none

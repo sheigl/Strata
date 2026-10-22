@@ -211,6 +211,58 @@ bool GgufExpertSource::pinned(int64_t layer, int64_t expert) const {
     return mirror_ptr_[(size_t) (layer * n_expert_ + expert)] != nullptr;
 }
 
+const uint8_t* GgufExpertSource::adopt(int64_t layer, int64_t expert, const void* dev_src, size_t bytes,
+                                       uint64_t cap_bytes, sycl::queue& q, std::string& err) {
+    if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_ || dev_src == nullptr) {
+        err = "adopt: bad argument";
+        return nullptr;
+    }
+    if (pinned(layer, expert)) return device_alias(layer, expert);   // nothing to do: the bytes are already there
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (bytes < lay.bytes[(size_t) layer]) {
+        err = "adopt: short blob";
+        return nullptr;
+    }
+    const uint64_t b = (lay.bytes[(size_t) layer] + 255) / 256 * 256;
+    if (mirror_bytes_ + b > cap_bytes) {
+        err = "adopt: the mirror cap is spent";
+        return nullptr;
+    }
+    // Smaller chunks than mirror()'s 2 GiB: adopts arrive a round at a time (at most --adapt-swaps blobs each).
+    constexpr uint64_t kAdoptChunk = 256ull << 20;
+    if (adopt_cur_ == nullptr || adopt_off_ + b > adopt_size_) {
+        const uint64_t want = std::max(b, std::min(kAdoptChunk, cap_bytes - mirror_bytes_));
+        uint8_t* nc = nullptr;
+        try {
+            nc = (uint8_t*) sycl::malloc_host((size_t) want, q);
+        } catch (const sycl::exception& ex) {
+            err = std::string("adopt: ") + ex.what();
+        }
+        if (nc == nullptr) {
+            if (err.empty()) err = "adopt: no pinned host memory for " + std::to_string(want >> 20) + " MiB";
+            return nullptr;
+        }
+        mirror_chunks_.push_back(nc);
+        adopt_cur_ = nc; adopt_off_ = 0; adopt_size_ = want;
+    }
+    uint8_t* dst = adopt_cur_ + adopt_off_;
+    try {
+        q.memcpy(dst, dev_src, (size_t) b);   // in-order with the slot's overwrite on the caller's stream
+    } catch (const sycl::exception& ex) {
+        err = std::string("adopt: ") + ex.what();
+        return nullptr;
+    }
+    adopt_off_ += b;
+    if (mirror_ptr_.empty()) {
+        mirror_ptr_.assign((size_t) (n_layers_ * n_expert_), nullptr);
+        layer_first_.assign((size_t) n_layers_, nullptr);
+    }
+    mirror_ptr_[(size_t) (layer * n_expert_ + expert)] = dst;
+    if (layer_first_[(size_t) layer] == nullptr) layer_first_[(size_t) layer] = dst;
+    mirror_bytes_ += b;
+    return dst;
+}
+
 const uint8_t* GgufExpertSource::device_alias(int64_t layer, int64_t expert) const {
     if (mirror_ptr_.empty() || layer < 0 || layer >= n_layers_) return nullptr;
     if (expert >= 0 && expert < n_expert_) {
