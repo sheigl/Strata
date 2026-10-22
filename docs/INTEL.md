@@ -955,6 +955,10 @@ temperature 0), Q4_K_M, `--max-context 131072`, `--vram-reserve-mib 1024`, `--pr
 | three, B580 starved | 22 / 24 / 2 | 19,822 | 14.51 GiB in 99.7 s | 280 s | 27.0 tok/s |
 | three, B580 full | **18 / 25 / 5** | 21,301 | **9.78 GiB** in 85.7 s | 480 s | 26.3 tok/s |
 
+(Previous install. On this box, at the same 131,072 and `--kv-resident 32768` but with a 109,557-token prompt, the
+pair and the three cards measure 26.8 and 28.3 tok/s with 22.62 and 13.84 GiB of mirror - the pinned-RAM half of that
+claim, not the 45%. See "Re-measured on 0.1.45, on the reinstalled box" below.)
+
 The last row is the one to use: half the pinned RAM of the pair and 45% more tokens per second. Its per-stage lines:
 
 ```
@@ -1012,6 +1016,10 @@ at 200,000 context, one 88,949-token prompt, then 200 tokens out:
 | start | 350 s | 520 s |
 | B580 coverage | 2,560 / 2,560 | 2,477 / 2,560 |
 
+These are the previous install's figures. On this box the same two settings measure **21.7 against 26.1 tok/s** at
+109,557 tokens of context, for 13.99 against 16.15 GiB of mirror - see "Re-measured on 0.1.45, on the reinstalled box"
+below for why the rates are lower here.
+
 The whole 200,000-cell K/V costs about 1.3 GiB of VRAM (the B70 gives up 332 cache slots, the B580 83 - so 83 of its
 pairs move to the mirror) and returns 2.3x the decode rate at 89K tokens for 0.5 GiB more net pinned RAM. Below 32,768
 tokens the two settings are identical, which is the "fine at first, worse as the workflow grows" shape. The AMD doc's
@@ -1039,9 +1047,96 @@ Left open:
   `chunk_bytes` machinery behind it, `src/program/generate.cpp:3888`) and its **NEAR TIE** recommendation (#1428). The
   gate drops a placement whose smallest stage cannot lend a 256-token prefill chunk, and only then falls back to the
   best one with a warning; without it `auto` can pick a placement that fails when a prompt arrives. Separate work.
-- 200,000 context is now measured on three cards with the whole K/V resident (above) and with it streamed; 135,168 is
-  not, and neither is an intermediate `--kv-resident` (e.g. 131,072 keeps the hot part resident and streams beyond) or
-  200,000 on the *pair* with everything resident.
+- 200,000 context is measured on three cards with the whole K/V resident (above) and with it streamed, and - added
+  2026-10-17 - on the *pair* with everything resident (below); 135,168 is not, and neither is an intermediate
+  `--kv-resident` (e.g. 131,072 keeps the hot part resident and streams beyond).
+
+### Re-measured on 0.1.45, on the reinstalled box (2026-10-17)
+
+The box the Q4_K_M split numbers above were taken on was reinstalled - Ubuntu 26.04, kernel 7.0.0-38, oneAPI 2026.2 -
+and the engine rebuilt from the v0.1.45 merge (`intel-arc-0.1.45`, AOT `bmg-g31`). Both halves of the 2026-10-15
+result hold on the new box, but the engine is *given* less VRAM here, so the rates are lower for the same work.
+
+**The install gives each split card less VRAM.** Same flags, same pack and same three-card layout as the 200,000
+`--kv-resident 0` run above:
+
+| | previous install, `0.1.43.1-sycl` | this install, `0.1.43.1-sycl` and `0.1.45-sycl` |
+|---|---|---|
+| B70 free, after its weights | 29.73 GiB | 28.14 GiB |
+| B70 cache, 200,000 context | 9,162 / 12,800 pairs | 8,627 / 12,800 pairs |
+| B580 free, after its weights | 11.37 GiB | 9.54 GiB |
+| B580 cache, 200,000 context | 2,477 / 2,560 pairs | 1,930 / 2,560 pairs |
+| mirror, 200,000 `--kv-resident 0` | 11.14 GiB | 16.15 GiB |
+
+The engine is not the cause. The **`0.1.43.1` binary kept from the previous install**, run on this box with identical
+flags and the identical prompt, prints `expert cache auto: 27.80 GiB free -> 8029 slots`, the same 8,627 and 1,930
+pairs and the same 16.15 GiB mirror that `0.1.45` prints, digit for digit - and the session costs 1.44 GiB in both.
+Nothing else holds the cards either: DRM fdinfo has ComfyUI at 175 MiB on the B70 and nothing on the other two, so
+the extra 1.59 GiB (B70) and 1.83 GiB (B580) are charged by the driver before the cache exists. Not investigated
+further. Its only cost is mirror size - 5 GiB more at 200,000 - so the rates above are lower here for the same work
+rather than unreproducible in kind.
+
+**The new engine decodes faster at the same resources.** Same box, same flags (`--max-context 200000`,
+`--kv-resident 0`, `--layer-split 18,43`), same prompt, and the same 200 generated tokens **byte for byte** (sha1
+`d19a159403df` in both runs):
+
+| build | prompt read | decode | drafts |
+|---|---|---|---|
+| `0.1.43.1-sycl` | 535.2 tok/s (204.7 s) | 19.4 tok/s (200 in 10.31 s) | 100 / 152 |
+| `0.1.45-sycl` | 529.8 tok/s (206.8 s) | **26.1 tok/s** (200 in 7.66 s) | 100 / 150 |
+
+**1.34x** the decode rate with the prompt read unchanged, on identical output: the merge's own work (one run each,
+and both sat through the same 109,557-token prefill before decoding).
+
+**Today's numbers** (`0.1.45-sycl`, Q4_K_M, `--vram-reserve-mib 1024 --prefill 4096 --kv int8 --spec 4
+--spec-min-p 0.5`, mirror cap 51,200 MiB, `temperature 0`, 200 tokens out). The prompt, so it can be rebuilt exactly:
+the repository's `docs/*.md` concatenated in name order and truncated to 356,000 characters, then
+`Summarize the documentation above in 200 tokens.` - **109,557 tokens** of it.
+
+| layout | K/V | prompt read | decode | drafts | mirror | start |
+|---|---|---|---|---|---|---|
+| three, 18 / 25 / 5 | `--kv-resident 32768` | 374.1 tok/s (292.9 s) | 21.7 tok/s | 100 / 152 | 13.99 GiB | 532 s |
+| three, 18 / 25 / 5 | `--kv-resident 0` | **529.8 tok/s** (206.8 s) | **26.1 tok/s** | 100 / 150 | 16.15 GiB | 541 s |
+| pair, 24 / 24 / - | `--kv-resident 0` | 513.7 tok/s (213.3 s) | 20.1 tok/s | 101 / 144 | **24.92 GiB** | 491 s |
+| pair, 24 / 24 / - | `--kv-resident 65536` | 412.0 tok/s (265.9 s) | 26.6 tok/s | 104 / 151 | 22.85 GiB | 578 s |
+
+The whole K/V in VRAM is 1.42x the prompt read and 1.20x the decode of streaming it, and the three cards are 1.30x
+the pair's decode for two thirds of its pinned RAM. The third row is the "200,000 on the *pair* with everything
+resident" that section 11 lists as not measured: the pair runs it, slower than the three cards on both axes and with
+half again the mirror. Arms 1 and 2 generated the same 200 tokens as each other, so that comparison is one text, not
+two samples.
+
+**The pair at 135,168** (the card set after the B580 came out, 2026-10-17): keeping 131,072 K/V cells resident does
+**not** fit - the head stage ends with 0.84 GiB free against the 851 MiB the smallest working cache needs, and the
+start is REFUSED. `--kv-resident 65536` (the last row above) is the one that runs: 26.6 tok/s, a 22.85 GiB mirror and
+0.80 GiB of K/V in pinned RAM, ~23.7 GiB pinned in all. The pair at 135,168 with the K/V *streamed*
+(`--kv-resident 32768`) measures 28.3 tok/s on a 13.84 GiB mirror in the table below - the cheaper-on-RAM option.
+
+**The 131,072 case**, the "Three cards" table's own context, `--kv-resident 32768`, the same 109,557-token prompt and
+200 tokens out:
+
+| layout | prompt read | decode | mirror | start |
+|---|---|---|---|---|
+| three, 18 / 25 / 5 | 538.4 tok/s (203.5 s) | 28.3 tok/s | 13.84 GiB | 509 s |
+| pair, 24 / 24 / - | 449.7 tok/s (243.6 s) | 26.8 tok/s | **22.62 GiB** | 479 s |
+
+The pinned-RAM claim stands and the decode claim shrinks: 61% of the pair's mirror, and 1.06x its decode, not the
+1.45x the 2026-10-15 short-prompt table records. What differs is what is being measured. That table's prompt is 100
+tokens of context, with nothing past `--kv-resident`'s 32,768 cells to stream, so the expert mirror is the only
+difference between its arms; here 76,789 cells stream from pinned RAM inside every attention in *both* arms, and that
+shared cost is what a third expert cache cannot pay down. Half of that short-prompt case was measured before this run
+was stopped - three cards, the same 100-token prompt, 500 tokens out: **16.1 tok/s**. The pair's arm did not answer,
+so the `+45%` is neither confirmed nor refuted here and needs one more run on this box.
+
+One measurement note, found the hard way: a decode rate taken seconds after a cold load reads far lower than the same
+settings read after a long prefill - the 100-token prompt measures 16.1 tok/s where the 109,557-token one measures
+28.3 at identical flags, cache and mirror, because the long prompt's 203 s prefill has the cards clocked and the
+mirror's pages warm before the first decoded token. The short-prompt rows, here and in the 2026-10-15 table, carry
+that cold-start penalty; they compare with each other, not with the long-prompt rows.
+
+At the free VRAM this install reports, an explicit `--layer-split 18,43` sizes its first cache at
+`27.80 GiB free -> 8029 slots`: the range the 2026-10-15 `auto`-against-explicit comparison recorded for `auto`
+(`27.94 -> 8070`), so that 2.16 GiB gap is not reproduced here and needs re-measuring on this box.
 
 ### Agent turns: IQ3_S against Q4_K_M (measured 2026-10-16)
 

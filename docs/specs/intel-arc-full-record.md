@@ -399,12 +399,69 @@ was prompt speed on HIP, where these two runs differ by +34% on the prompt too.
 - `auto` leaves the first stage **2.16 GiB less** free VRAM than an explicit `--layer-split` with the same K
   (`expert cache auto: 27.94 GiB free -> 8070 slots` vs `30.10 -> 8718`; the search ran and the explicit path did
   not), so its mirror is 11.27 GiB against 9.78. Reproduced twice, identical numbers. Something between the stage
-  setup and the search's `cap[]` loop holds VRAM on the first device; not yet found.
+  setup and the search's `cap[]` loop holds VRAM on the first device; not yet found. Not reproduced on the
+  reinstalled box (2026-10-17): an explicit `--layer-split 18,43` there sizes its first cache at `27.80 GiB free ->
+  8029 slots`, the `auto` range, so the gap has to be re-measured there before it is chased.
 - The search's absolute prediction is still far off the measurement (55.9 ms predicted, ~154 ms measured), although
   its *ranking* is now right. The obvious next model: the last stage's misses cost more than the middle stages', since
   nothing is behind them to hide the latency.
-- 135K / 200K context on three cards, and IQ3_S on three cards (its per-stage mirror should not even be needed), are
+- 135K context on three cards, and IQ3_S on three cards (its per-stage mirror should not even be needed), are
   unmeasured. The B580 as a *vision encode card* (section 10) is still unbuilt.
+
+### Re-measured on 0.1.45 and the reinstalled box (2026-10-17)
+
+The box was reinstalled - Ubuntu 26.04, kernel 7.0.0-38, oneAPI 2026.2 - and the engine rebuilt from the v0.1.45 merge
+(`intel-arc-0.1.45`, AOT `bmg-g31`). Same flags, same pack: the free VRAM `--expert-cache auto` sizes from is 1.59 GiB
+smaller on the B70 and 1.83 GiB smaller on the B580, the two caches lose 535 and 547 pairs, and the 200,000 mirror
+grows 11.14 -> 16.15 GiB.
+
+| | previous install, `0.1.43.1-sycl` | this install, `0.1.43.1-sycl` | this install, `0.1.45-sycl` |
+|---|---|---|---|
+| B70 free, after its weights | 29.73 GiB | 28.14 GiB | 28.14 GiB |
+| B70 cache, 200,000 context | 9,162 | 8,627 | 8,627 |
+| B580 free, after its weights | 11.37 GiB | 9.54 GiB | 9.54 GiB |
+| B580 cache, 200,000 context | 2,477 | 1,930 | 1,930 |
+| mirror, 200,000 `--kv-resident 0` | 11.14 GiB | 16.15 GiB | 16.15 GiB |
+| `--expert-cache auto` reading | 29.39 GiB -> 8,506 slots | 27.80 -> 8,029 | 27.80 -> 8,029 |
+
+The middle column is the attribution: the previous install's own `0.1.43.1` binary reproduces this install's figures
+digit for digit, so the drop is the driver's free-memory report, not the engine (the session costs 1.44 GiB in both).
+DRM fdinfo shows nothing holding either card but ComfyUI's 175 MiB on the B70. Its cost is mirror size alone.
+
+The merge's own effect, isolated - same box, same flags, same prompt, **byte-identical 200 generated tokens** (sha1
+`d19a159403df`): `0.1.43.1` at 535.2 tok/s read and 19.4 tok/s decode (200 in 10.31 s, 100/152 drafts) against
+`0.1.45` at 529.8 tok/s and **26.1 tok/s** (200 in 7.66 s, 100/150) - 1.34x the decode rate, the prompt read
+unchanged.
+
+Today's arms (`0.1.45`, 200,000, `--vram-reserve-mib 1024 --prefill 4096 --kv int8 --spec 4`, mirror cap 51,200 MiB,
+`temperature 0`, 200 tokens out, one prompt = this repository's `docs/*.md` in name order truncated to 356,000
+characters plus `Summarize the documentation above in 200 tokens.`, 109,557 tokens):
+
+| K/V | layout | prompt read | decode | drafts | mirror | start |
+|---|---|---|---|---|---|---|
+| `--kv-resident 32768` | three, 18 / 25 / 5 | 374.1 tok/s (292.9 s) | 21.7 tok/s | 100 / 152 | 13.99 GiB | 532 s |
+| `--kv-resident 0` | three, 18 / 25 / 5 | 529.8 tok/s (206.8 s) | 26.1 tok/s | 100 / 150 | 16.15 GiB | 541 s |
+| `--kv-resident 0` | pair, 24 / 24 / - | 513.7 tok/s (213.3 s) | 20.1 tok/s | 101 / 144 | 24.92 GiB | 491 s |
+| `--kv-resident 65536` | pair, 24 / 24 / - | 412.0 tok/s (265.9 s) | 26.6 tok/s | 104 / 151 | 22.85 GiB | 578 s |
+
+Both 2026-10-15 directions stand - 1.42x the prompt read and 1.20x the decode for the resident K/V, 1.30x the
+decode for three cards over the pair at two thirds of its pinned RAM - and the pair does run 200,000 with everything
+resident, the run the `Open` list above called unmeasured: just slower than the three cards on both axes.
+
+With the B580 out (2026-10-17) the pair at 135,168 does not fit `--kv-resident 131072` - the head stage is REFUSED
+with 0.84 GiB free against the 851 MiB the smallest cache needs; the resident K/V crowds it out. `--kv-resident
+65536` is the setting that runs (the last row): 26.6 tok/s on a 22.85 GiB mirror plus 0.80 GiB of K/V in pinned RAM.
+Streamed (`--kv-resident 32768`) at the same 135,168 is the memory-cheaper option.
+
+At 131,072, `--kv-resident 32768` - the 2026-10-15 table's own setting - with the same 109,557-token prompt, the pair
+measures 26.8 tok/s decode against the three cards' 28.3, on 22.62 against 13.84 GiB of mirror. The mirror halves; the
+decode does not (1.06x, against the 1.45x that short-prompt table records). What differs is what is being measured:
+its 100-token prompt leaves nothing past `--kv-resident`'s 32,768 cells to stream, so its arms differ only in the
+expert mirror, while at a long context 76,789 cells stream in *both* arms and dominate the window. The short-prompt
+case was half re-measured before the run was stopped - three cards, 100-token prompt, 500 tokens out: **16.1 tok/s**;
+the pair's arm did not answer, so the +45% is left open. Same flags, cache and mirror throughout, so that 16.1 against
+the long prompt's 28.3 is a cold-start effect: the long prompt's 203 s prefill is what has the cards clocked and the
+mirror's pages warm before the first decoded token.
 
 ## 12. Agent turns: IQ3_S against Q4_K_M, and what the third card is worth (2026-10-16)
 

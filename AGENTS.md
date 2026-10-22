@@ -47,13 +47,31 @@ offers the same steps as tools.
   per-stage link pricing (`link_scale`), and the measured coverage curve was gated to `ns >= 4`, so 3-GPU `auto`
   picked `K=2,47` (43.4 GiB mirror, never started inside the 900 s budget) — it now picks `K=18,43` with no
   environment variable. `setup_intel.py` writes `STRATA_SPLIT_MIRROR=1`/`STRATA_STAGE_TRIM=1` for every split. **Long
-  context, measured 2026-10-15:** at 200,000 context `--kv-resident 0` (the whole K/V in VRAM, ~1.3 GiB) decodes at
-  **35.2 tok/s** with 89K tokens of context behind it against 15.5 tok/s for the `--kv-resident 32768` the live configs
-  and the AMD docs use, and reads an 88,949-token prompt at 1,026 against 764 tok/s; the mirror grows 9.85 → 11.14 GiB
-  for +0.5 GiB net pinned RAM. See "Long context" and "Three cards" in [docs/INTEL.md](docs/INTEL.md) and section 11 of
-  [docs/specs/intel-arc-full-record.md](docs/specs/intel-arc-full-record.md). Remaining gap to IQ3_S's 67 tok/s is
-  PCIe mirror drag; open: the ~2.16 GiB VRAM difference between `auto` and an explicit split, and the B580 as a
-  vision encode card. Designs: [docs/specs/intel-arc-per-stage-mirror.md](docs/specs/intel-arc-per-stage-mirror.md),
+  context, measured 2026-10-15 on the previous install:** at 200,000 context `--kv-resident 0` (the whole K/V in
+  VRAM, ~1.3 GiB) decodes at **35.2 tok/s** with 89K tokens of context behind it against 15.5 tok/s for the
+  `--kv-resident 32768` the live configs and the AMD docs use, and reads an 88,949-token prompt at 1,026 against 764
+  tok/s; the mirror grows 9.85 → 11.14 GiB for +0.5 GiB net pinned RAM. **Re-measured 2026-10-17 on the reinstalled
+  box, engine 0.1.45 (oneAPI 2026.2):** the direction holds — `--kv-resident 0` **26.1 tok/s** against the `32768`
+  arm's 21.7 and 530 against 374 tok/s read, at 109,557 tokens of context; three cards **26.1** against the pair's
+  20.1 for two thirds of the pinned RAM (16.15 against 24.92 GiB), the pair at 200,000 with everything resident being
+  the run section 11 had listed as unmeasured. At 131,072 with `--kv-resident 32768` the mirror still halves (13.84
+  against 22.62 GiB) but the decode lead is 1.06x, not the 1.45x the 2026-10-15 short-prompt table records: that
+  prompt leaves nothing past 32,768 cells to stream, this one streams 76,789 in both arms. Its short-prompt case is
+  half-measured — three cards **16.1 tok/s** at a 100-token prompt against 28.3 at 109,557 tokens, same flags and
+  cache (a cold-start effect: only the long prompt's 203 s prefill warms the cards) — and the pair's arm still needs
+  one run. What moved the absolute figures is the install, not the merge: it
+  charges each card ~1.7 GiB more before the cache exists, so the caches are 8,627/1,930 pairs against 9,162/2,477
+  and the mirror 16.15 against 11.14 GiB — the previous install's own `0.1.43.1` binary reproduces the new figures
+  digit for digit, while `0.1.45` decodes **1.34x** that binary's rate on byte-identical output. **B580 removed
+  2026-10-17:** the pair (B65+B70) at 135,168 cannot hold `--kv-resident 131072` — REFUSED, 0.84 GiB free on the head
+  stage against the 851 MiB the smallest cache needs — so the live `strata-swift-q4_k_m-split.json` runs
+  `--kv-resident 65536` (measured: READY 578 s, 412 tok/s read of a 109,557-token prompt, 26.6 tok/s decode, 22.85
+  GiB mirror + 0.80 GiB K/V pinned, `level_zero:0,1`). See "Long context",
+  "Three cards" and "Re-measured on 0.1.45, on the reinstalled box" in [docs/INTEL.md](docs/INTEL.md) and section 11
+  of [docs/specs/intel-arc-full-record.md](docs/specs/intel-arc-full-record.md). Remaining gap to IQ3_S's 67 tok/s is
+  PCIe mirror drag; open: the ~2.16 GiB VRAM difference between `auto` and an explicit split (not reproduced on the
+  new box — an explicit `18,43` reads `27.80 GiB free -> 8029 slots`, the `auto` range), and the B580 as a vision
+  encode card. Designs: [docs/specs/intel-arc-per-stage-mirror.md](docs/specs/intel-arc-per-stage-mirror.md),
   [docs/specs/intel-arc-autosplit-fix.md](docs/specs/intel-arc-autosplit-fix.md).
 
 ## Contributing a change or report
