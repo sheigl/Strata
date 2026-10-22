@@ -830,7 +830,8 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
-    const bool self_commit = T == 1 && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
+    // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
+    const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     // SYCL port, STRATA_VERIFY_EAGER=1: the window runs on the queue instead of as a graph, and each stage stamp is
     // a host-side wait + clock (there is no %globaltimer here), so the existing stage profiler reports ms per stage.
@@ -2658,7 +2659,7 @@ bool Verifier::commit(int n_keep, std::string &err) try {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && one_token_self_commit()) {
+    if (last_t_ == 1 && !always_publish_ && one_token_self_commit()) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -3855,23 +3856,14 @@ catch (sycl::exception const &exc) {
 bool Verifier::done(std::string &err) try {
     if (!fl_active_ || fl_k_ < fl_total_) return false;
     const OnDevice on_device(device_);
-    const dpct::err0 q = dpct::sycl_event_query(ev_done_);
-
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (q != 0) {
-      err = std::string("verify: ") + dpct::get_error_string_dummy(q);
-      return false;
+    // dpct's query is 0 (complete) or 1 (still running); a SYCL error arrives as an exception, caught below.  The CUDA
+    // path's cudaErrorNotReady branch: a window still on the GPU is polled again, not failed.
+    if (dpct::sycl_event_query(ev_done_) != 0) {
+        const double now = now_ms();
+        if (now - fl_flush_ms_ > 2.0) { fl_flush_ms_ = now; (void) cs_->ext_oneapi_empty(); }
+        if (now - fl_since_ms_ > 20000.0)   // every layer served, and the graph still runs: #267 as in service()
+            err = "verify: the window never finished" + released_note(release_gpu_waits(5000));
+        return false;
     }
     if (copy_used_) {   // no host function of this window may raise flag B in the next one
         if (((copy_)->ext_oneapi_empty() ? 0 : 1) == 1) return false;
