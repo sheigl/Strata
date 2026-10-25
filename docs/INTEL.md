@@ -741,6 +741,18 @@ on the same card. Logprobs for "Paris" (IQ2_XS) -0.0019 (p 0.998).
 model fixtures or the tensor-core kernel. Parity gaps that remain: `s2_expert_grouped_parity` (the s2 path), `kv_hybrid_parity`'s
 last step on the XMX kernel, `ple_parity` and `native_expert_parity` need model files.
 
+**Tests (0.1.50, 2026-10-25, after the 0.2.5 merge; native build, icpx 2026.2, AOT `bmg-g31`, on the B65 + B70 box, no
+container).** 28 of the 35 `*_parity` binaries pass, among them `gdn_parity`, `iq_multi_parity`, `native_grouped_parity`,
+`native_multi_parity`, `resident_plan_parity`, `verify_parity` and `kv_hybrid_parity` in full, which closes the XMX last-step gap
+above. Five need model files and cannot run from the binary alone: `iq_parity` (it skips in `--selftest`), `native_expert_parity`,
+`ple_parity`, `tq_sycl_parity`, `qsa_prompt_attn_parity`. Two fail, and fail with the same lines on the build from the commit
+before the merge, so they are not a merge result:
+
+- `gr_parity`: the fused GR read never writes its consumer's `q8_1` image (`QFUSE: T=1 rep 0: not written`), so the
+  `STRATA_QFUSE` T 1..8 direct and graph replays and the max-T=8 LDS launch and replay fail; every other case in that binary
+  passes. Not ported yet.
+- `s2_expert_grouped_parity`: 4 failures (the s2 path above).
+
 **Fixed bugs worth knowing if you see the symptom** (fixed long ago; the symptom is listed so a search finds this line). `--stream-experts` read
 the wrong shard for layers past a shard boundary (NaN logits from layer 13 on, Swift 1.5). IQ2_XS products were garbage because of
 a type pun the SYCL compiler does not honour. A prompt that borrowed cache slots hung in its first chunk (stager deadlock under
