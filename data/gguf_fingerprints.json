@@ -295,6 +295,24 @@
   ],
   "repo": "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF"
  },
+ "swift/Q4_K_M": {
+  "arch": "qwen4exp",
+  "tensors": 1224,
+  "bytes": 119588006400,
+  "expert_bytes": {
+   "Q4_K": 45298483200,
+   "Q5_0": 13841203200,
+   "Q8_0": 21390950400
+  },
+  "experts_bpw": 5.333,
+  "bpw": 5.407,
+  "files": [
+   "Swift-1.5-Qwen3.8-Flash-Next-Q4_K_M-00001-of-00003.gguf",
+   "Swift-1.5-Qwen3.8-Flash-Next-Q4_K_M-00002-of-00003.gguf",
+   "Swift-1.5-Qwen3.8-Flash-Next-Q4_K_M-00003-of-00003.gguf"
+  ],
+  "repo": "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF"
+ },
  "_roles": {
   "blk.N.attn_gate.weight": [
    "IQ3_S",
@@ -360,6 +378,7 @@
   "blk.N.ffn_down_exps.weight": [
    "IQ4_NL",
    "Q2_0",
+   "Q5_0",
    "Q5_1",
    "Q8_0",
    "TQ2_T",
@@ -430,6 +449,7 @@
   ],
   "blk.N.hc_attn_down.weight": [
    "BF16",
+   "Q4_K",
    "Q6_K",
    "Q8_0"
   ],
@@ -443,10 +463,12 @@
   ],
   "blk.N.hc_attn_up.weight": [
    "BF16",
+   "Q5_0",
    "Q8_0"
   ],
   "blk.N.hc_ffn_down.weight": [
    "BF16",
+   "Q4_K",
    "Q6_K",
    "Q8_0"
   ],
@@ -460,6 +482,7 @@
   ],
   "blk.N.hc_ffn_up.weight": [
    "BF16",
+   "Q5_0",
    "Q8_0"
   ],
   "blk.N.indexer.k_norm.weight": [
@@ -481,6 +504,7 @@
   "blk.N.ple_key.weight": [
    "BF16",
    "Q2_0",
+   "Q4_K",
    "Q6_K",
    "Q8_0"
   ],
@@ -495,6 +519,7 @@
   ],
   "blk.N.ple_value.weight": [
    "BF16",
+   "Q4_K",
    "Q6_K",
    "Q8_0"
   ],
@@ -549,12 +574,14 @@
    "Q8_0"
   ],
   "per_layer_token_embd.weight": [
-   "IQ4_NL"
+   "IQ4_NL",
+   "Q5_0"
   ],
   "token_embd.weight": [
    "IQ3_S",
    "IQ4_XS",
    "Q3_K",
+   "Q4_K",
    "Q6_K",
    "Q8_0"
   ]
