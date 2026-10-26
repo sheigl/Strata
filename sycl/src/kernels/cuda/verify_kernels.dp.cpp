@@ -2404,6 +2404,33 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     }
     check("resident_plan");
 }
+void resident_plan_mirror(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
+                          const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
+                          long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err,
+                          const int32_t* mirror_res, const unsigned long long* mirror_table) {
+    // STRATA_SPLIT_MIRROR: resident_plan with the mirror table passed in, not the globals - each layer-split stage's
+    // verifier plans against its own table (on its own device context), so concurrent stage verifies are safe.
+    const unsigned long long* mir = nullptr;   // the layer's slice of the caller's host-mirror table, if any
+    if (mirror_table != nullptr && mirror_res != nullptr && res_layer >= mirror_res)
+        mir = mirror_table + (res_layer - mirror_res);
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        strata::q_of(stream)
+            ->parallel_for<dpct_kernel_name<class resident_plan_mirror_kernel_4f1c2d>>(
+                sycl::nd_range<3>(sycl::range(1, 1, kResidentPlanMax),
+                                  sycl::range(1, 1, kResidentPlanMax)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        resident_plan_kernel(
+                            ids, n_entries, k, res_layer, n_expert, cache_base,
+                            slot_off, blob, plan, capx, skip, ring, mir, plan_err, nullptr);
+                    });
+    }
+    check("resident_plan_mirror");
+}
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     const uint32_t spin_max = strata::spin_max(*strata::q_of(stream));
     {

@@ -55,6 +55,10 @@ struct VerifyHits {
     const uint64_t* slot_off = nullptr;   ///< E-6: host per-slot offsets when slots differ in size (null: slot * blob)
     int64_t n_slots = 0;                  ///< E-6: how many (for the device copy)
     int64_t blob = 0;
+    /// SYCL port (STRATA_SPLIT_MIRROR): this verifier's own host-mirror table ([n_layers * n_expert] device-readable
+    /// addresses on THIS stage's device context, 0 = none), indexed by global layer against `d_res`.  Null: the
+    /// legacy global set by resident_plan_set_mirror applies (the single-card / first-stage-only path).
+    const unsigned long long* mirror_table = nullptr;
 };
 
 class Verifier {
