@@ -390,10 +390,18 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // folded into up it left the hidden near 1e-5, whose Q8_0 block scale is an FP16 subnormal (expert error 2-12%)
     float sg = 1.f, su = 1.f;
     if (f.tail_off) {
-        float tail[4];
-        std::memcpy(tail, blob + f.tail_off, sizeof tail);
-        sg = tail[0];
-        su = tail[1];
+        if (f.tail_off + sizeof(float) * 4 > f.bytes) {   // a format that does not belong to this blob: never read past it
+            static std::once_flag said;
+            std::call_once(said, [&] {
+                std::fprintf(stderr, "strata: native expert format does not fit its blob (tail %zu, blob %zu, types %d/%d)\n",
+                             f.tail_off, f.bytes, f.gu_type, f.d_type);
+            });
+        } else {
+            float tail[4];
+            std::memcpy(tail, blob + f.tail_off, sizeof tail);
+            sg = tail[0];
+            su = tail[1];
+        }
     }
     // NVFP4 in 512-bit lanes: ggml's arithmetic, blocks decoded once per window; 1.8x at one token, 3.7x at seven
     // (nvfp4_avx512_parity). STRATA_NO_NVFP4_512 falls back to ggml-cpu.

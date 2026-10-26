@@ -4,7 +4,7 @@
 # environment handling but execs the binary directly instead of in a container, so the config's args use HOST
 # paths (no /work mount) and STRATA_SYCL_ROOT is unused.
 #
-#   STRATA_SYCL_BIN    the engine binary, relative to the repo   (default: build-sycl/strata)
+#   STRATA_SYCL_BIN    the engine binary, relative to the repo   (default: build-sycl-aot/strata)
 #   STRATA_ONEAPI      the oneAPI root to source setvars.sh from (default: /opt/intel/oneapi)
 # Passed through to the engine: every variable of this script's environment that starts with STRATA_ (the config's
 # "env" block arrives that way: the server puts it in the engine's environment), ONEAPI_ (level_zero:0,1 for a
@@ -35,4 +35,4 @@ for k in "${!setting[@]}"; do
     case "${setting[$k]}" in 0|"") ;; *) export "$k=${setting[$k]}" ;; esac
 done
 
-exec "$here/${STRATA_SYCL_BIN:-build-sycl/strata}" "$@"
+exec "$here/${STRATA_SYCL_BIN:-build-sycl-aot/strata}" "$@"
