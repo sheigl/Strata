@@ -633,6 +633,37 @@ Where they differed is *which* tool they called on the same turn (9 of 42 paired
 rank. Details, the raw evidence and the open questions: section 12 of
 [the full record](specs/intel-arc-full-record.md).
 
+## Three B580s and IQ3_S: the CPU pool's rows are wrong on xe (2026-10-26, engine 0.1.51)
+
+Three plain B580s (36 GB of VRAM, Ryzen 7 1700, 48 GB of RAM) on ISTA-DASLab's Qwen3.8-Flash-Next IQ3_S: 46.8 GiB of
+experts, 4.2 GiB of dense weights and a 26.8 GiB PLE table against 36 GB of VRAM. No placement holds every expert, so
+this is the partial-coverage case the per-stage mirror exists for: `STRATA_SPLIT_MIRROR=1` with layers 17/33 gives
+12.1k of 24.6k expert slots in VRAM and a 24 GiB pinned mirror, and the model starts where a first-stage-only mirror
+refuses it.
+
+Two ways to compute the experts no cache holds, both measured on the same build, the same split and the same prompt
+(200 tokens at temperature 0):
+
+| path | flags | decode | prompt (9.5k) | expert-cache hit | answers |
+|---|---|---|---|---|---|
+| the GPU reads each miss from the pinned mirror | `--stream-experts` | **6.3-7.2 tok/s** | 85 tok/s | 92-98% | correct |
+| the CPU pool computes the misses from the GGUF | `--mmap-experts --pcie-frac 0`, host handshakes on | 18-50 tok/s | 116-214 tok/s | 92-98% | **degenerate** |
+
+The second row is 5x faster and unusable. With the host handshakes on, the engine returned a stream of `!` after the
+first few tokens of every answer, on repeated fresh starts, and earlier crashed in a pool worker (SIGSEGV in
+`native_gu_rows`, on an NVFP4 scale tail the model has no experts for: the format handed to the pool was not that
+blob's). The same binary, the same model and the same split with `STRATA_VERIFY_NO_HOST=1` answer correctly, which is
+the rule this page already states: the host's handshake flags cannot be trusted on xe once part of the experts is
+outside VRAM. The speed difference is real - it is the rows' transfer - which is what makes the path worth fixing
+rather than deleting.
+
+`STRATA_MIRROR_ADAPT=1` (the adaptive tier kept on by adopting each swap-out into the mirror) measured 6.4 tok/s
+against 6.3 without it on these prompts: the profile fill already holds the hot pairs here, so the tier had little to
+add.
+
+Not tested: a conversation-shaped workload (all numbers above are single prompts), an Alchemist card, and any fix for
+the handshake path itself.
+
 ## History / older measurements
 
 Dated results from earlier engines. They show how the numbers moved and are not instructions. Narrative from the original work
