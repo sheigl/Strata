@@ -2786,8 +2786,32 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
     if (njobs > 0) {
-        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
-        else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+        if (native) {
+            // The layout and the blob must agree before the pool reads them: a `fmt` that is not this layer's (or a
+            // blob shorter than the format says) walks past the end of the blob inside native_gu_rows - a SIGSEGV in a
+            // pool worker with no clue which layer.  Refuse the dispatch with the numbers instead.
+            const size_t li = (size_t) d.layers;
+            if (li >= lay.fmt.size() || (int64_t) li >= (int64_t) lay.n_layers) {
+                d.failed = true;
+                d.fail = "the expert dispatch names a layer the pack has no format for";
+                d.fail_layer = d.layers;
+                return;
+            }
+            const strata::kernels::cpu::NativeFmt& lf = lay.fmt[li];
+            const uint64_t pack_bytes = (uint64_t) lay.blob_bytes(d.layers);
+            if (lf.bytes != pack_bytes) {
+                static thread_local std::string why;
+                why = "the layer's expert format does not match its blob (" + std::to_string((unsigned long long) lf.bytes) +
+                      " against " + std::to_string((unsigned long long) pack_bytes) + " bytes)";
+                d.failed = true;
+                d.fail = why.c_str();
+                d.fail_layer = d.layers;
+                return;
+            }
+            d.pool->run_split_multi_native(lf, d.jobs_multi.data(), njobs);
+        } else {
+            d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+        }
     }
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
