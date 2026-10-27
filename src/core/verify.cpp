@@ -3385,6 +3385,13 @@ bool Verifier::commit(int n_keep, std::string& err) {
 #endif
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
+    static const bool rpc_trace = [] {
+        const char* v = std::getenv("STRATA_RPC_TRACE");
+        return v != nullptr && v[0] != '0';
+    }();
+    if (rpc_trace)
+        std::fprintf(stderr, "RPC trace: commit [%lld,%lld) dev %d keep %d of %d at %lld\n", (long long) lb_,
+                     (long long) le_, device_, n_keep, last_t_, (long long) last_pos0_);
     const Clock::time_point t0 = Clock::now();
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;

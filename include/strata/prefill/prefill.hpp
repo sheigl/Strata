@@ -10,6 +10,7 @@
 // Requires the native weights (`--native`): every quantized projection must carry its GGUF blocks.
 #pragma once
 
+#include "strata/prefill/prefill_stage.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
@@ -51,7 +52,7 @@ namespace strata::prefill {
 void warm_gemm_libraries(int device);
 
 
-class Prefill {
+class Prefill : public PrefillStage {
 public:
     /// E-9: the draft layer's K/V for prompt cells [cell0, cell0 + n) from their final residual rows `R_rows`
     /// (device) and `next_tokens` (host: the token at cell+1), in batches through this path's GEMMs and its idle
@@ -109,7 +110,7 @@ public:
     /// spellings of one value, e.g. a request key and the flag, compare equal).
     static int64_t pipe_key(double value);
     /// The stages of the prompt path from this one on (1 without a layer split).
-    int stage_count() const;
+    int stage_count() const override;
     /// --prefill-pipe on a layer split's first stage: the chunk an `n`-token segment is read in when it is read whole
     /// (pipeline_chunk over chunk(), the stage count and pipe_setting()), or 0 when the pipe is off here (one stage,
     /// value 0, or a later stage) and the buffers' chunk applies.  The engine plans a segment once, on its whole
@@ -122,7 +123,7 @@ public:
     /// One log line for a planned segment (the same as a whole read logs when its plan differs from chunk()).
     static void log_plan(int64_t n, int64_t chunk, int stages);
     /// The expert blobs this stage and the later ones copied host -> device so far (PrefillStats::experts_streamed).
-    int64_t chain_experts_streamed() const;
+    int64_t chain_experts_streamed() const override;
     /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
     static void set_ring_override(int slots);
@@ -213,7 +214,10 @@ public:
     /// a run of such chunks allocates no pinned memory (STRATA_PIPED_CONCURRENT: an allocation or free on the read's
     /// thread takes the driver's lock).  Before the run, with nothing of this path in flight.  False: a slot could
     /// not be had (it then grows at first use, as before).
-    bool reserve_uploads(int64_t T);
+    bool reserve_uploads(int64_t T) override;
+    bool run_chunk(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) override;
+    void set_handoff(const void* rows, const void* event, int pieces, bool single_chunk, bool pipe_chunked) override;
+    void log_mmq_direct_totals() const override;
 
     /// The vision path: HOST rows (n_embd floats) indexed by absolute position, read in place of the token
     /// embedding where non-null (an image's <|image_pad|> cells).  Null (default): every position embeds its token.
@@ -224,7 +228,7 @@ public:
     /// previous stage instead of embedding the tokens; a stage that does not end at the last layer copies its rows
     /// to pinned host buffers (two, allocated by `init`) and runs `next` on them - on a thread, so the next stage
     /// reads chunk c while this one reads chunk c + 1.  `on_chunk` belongs on the last stage.  Set before `init`.
-    void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
+    void set_stage(int64_t layer_begin, int64_t layer_end, PrefillStage* next) {
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
 
@@ -260,13 +264,13 @@ private:
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
-    bool drain_pipeline(std::string& err);
+    bool drain_pipeline(std::string& err) override;
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
     std::vector<int> tap_layers_;
     int64_t tap_first_ = 0, tap_cap_ = 0;
     float* tap_dev_ = nullptr;
-    Prefill* next_ = nullptr;
+    PrefillStage* next_ = nullptr;
     Prefill* helper_ = nullptr;         ///< set_stage_helper
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     int64_t stopped_at_ = -1;           ///< stop_at_chunk ended the last run after this many tokens (-1: it read all)

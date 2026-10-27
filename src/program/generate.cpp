@@ -80,6 +80,7 @@
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/split_rules.hpp"
+#include "strata/program/stage_runtime.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
 #include "strata/program/split_ring.hpp"
@@ -91,6 +92,9 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
 #include "strata/program/batch_groups.hpp"
+#include "strata/program/rpc_prefix_stage.hpp"
+#include "strata/program/rpc_worker.hpp"
+#include "strata/rpc/control.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
@@ -150,6 +154,17 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <string>
 #include <set>
 #include <vector>
+
+using strata::program::Drive;
+using strata::program::drive_pool;
+using strata::program::drive_pool_multi;
+using strata::program::SplitDrive;
+using strata::program::stage_for_layer;
+using strata::program::drive_pool_split;
+using strata::program::GpuStage;
+using strata::program::RpcPrefixStage;
+using strata::program::RpcWorkerStage;
+using strata::program::run_rpc_worker;
 
 namespace {
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
@@ -713,6 +728,14 @@ struct Options {
     /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
     /// from each GPU's free VRAM); empty = one GPU
     std::string layer_split;
+    /// Opt-in RPC layer split: one worker process owns [0,K) and this process owns [K,n_layers).  The supervisor
+    /// hands the authenticated control socket to the controller as an inherited fd.
+    std::string rpc_listen;
+    std::string rpc_connect;
+    std::string rpc_range;
+    int64_t rpc_lo = 0;
+    int64_t rpc_hi = -1;
+    bool rpc_worker = false;
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
@@ -1118,121 +1141,6 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
     if (out.empty()) { err = "token list was empty"; return false; }
     return true;
 }
-
-/// The pool's adapter plus the wall-clock it spent, so the report can say how much of the token was the CPU.
-struct Drive {
-    strata::core::ExpertDispatch d;
-    double cpu_ms = 0;
-    int64_t calls = 0;
-    /// THE ROUTING TRACE, which is P0.S8 and a stated prerequisite of Phase 3.  `drive_pool` is called once
-    /// per layer from the main loop - the workers live inside `expert_pool_dispatch` - so a single FILE* here
-    /// needs no locking.  `d.layers` is the CURRENT layer on entry (the adapter increments it as it walks the
-    /// blob), which is why the layer index comes from there rather than from a counter of our own.
-    std::FILE* routing = nullptr;
-};
-
-void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
-                float* out) {
-    Drive* t = (Drive*) user;
-    const Clock::time_point a = Clock::now();
-    strata::core::expert_pool_dispatch(&t->d, x_f, ids, weights, n_embd, k, out);
-    t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
-    ++t->calls;
-    // THE ROUTING TRACE.  Written AFTER the dispatch so the layer index is still this layer's: `d.layers` is
-    // advanced by the adapter as it consumes the blob, and reading it after the call is the same value the
-    // dispatch used.  Record = int32 layer, int32 k, k int32 ids, k float weights.
-    if (t->routing != nullptr) {
-        // **`d.layers` HAS ALREADY BEEN ADVANCED BY THE TIME THIS RUNS, AND THE FIRST TRACE WAS OFF BY ONE
-        // BECAUSE OF IT.**  The adapter walks the blob by incrementing `d.layers` as it consumes each layer's
-        // experts, so after the dispatch it holds the NEXT layer's index.  `tools/make_profile.py` caught it
-        // with a bounds check when the trace turned out to span 1..48 instead of 0..47.  The hit-rate CURVE was
-        // unaffected - it is a per-layer split, and shifting every layer by one preserves both metrics - but
-        // anything keyed on the layer index, which is exactly what a cache profile is, would have been wrong.
-        const int32_t layer_idx = (int32_t) (t->d.layers - 1);
-        if (layer_idx < 0 || layer_idx >= 48) {
-            std::fprintf(stderr, "strata generate: the routing trace saw layer %d, outside 0..47\n", layer_idx);
-            return;
-        }
-        const int32_t rec[2] = {layer_idx, (int32_t) k};
-        std::fwrite(rec, sizeof rec, 1, t->routing);
-        std::fwrite(ids, sizeof(int32_t), (size_t) k, t->routing);
-        std::fwrite(weights, sizeof(float), (size_t) k, t->routing);
-    }
-}
-
-/// Plan v0.3 P6: the pool for a verify window.
-void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
-    Drive* t = (Drive*) user;
-    t->d.layers = layer;
-    const Clock::time_point a = Clock::now();
-    strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
-    t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
-    ++t->calls;
-    // the routing trace for the serve path: the same record format drive_pool writes (layer, k, ids, weights),
-    // one record per token.  The multi dispatch fuses the router weights into the kernel and does not surface
-    // them, so records carry unit weights: tools/make_profile.py ranks pairs by routed frequency, which is the
-    // signal that matters; a one-shot --dump-routing run records true weights if a weighted ranking is wanted.
-    if (t->routing != nullptr && layer >= 0 && layer < 48) {
-        for (int64_t tok = 0; tok < n_tok; ++tok) {
-            const int32_t rec[2] = {(int32_t) layer, (int32_t) k};
-            std::fwrite(rec, sizeof rec, 1, t->routing);
-            std::fwrite(ids + tok * k, sizeof(int32_t), (size_t) k, t->routing);
-            static const float one[64] = {};   // k <= 64 in a verify window; zeros read as unit weights
-            std::fwrite(one, sizeof(float), (size_t) k, t->routing);
-        }
-    }
-}
-
-/// Layer split: every verify stage shares one Drive (its counters, usage and failure flags); the GPU plan, the expert
-/// cache and the PCIe share the pool uses for a layer are those of the stage that runs it.
-struct SplitDrive {
-    static constexpr int kMax = 8;
-    Drive* base = nullptr;
-    int n = 0;                                    ///< stages
-    int64_t end[kMax] = {};                       ///< stage i runs the layers from end[i - 1] (0) below end[i]
-    strata::core::GpuPlanSink* plan[kMax] = {};
-    const uint8_t* cache_base[kMax] = {};
-    const uint64_t* cache_slot_off[kMax] = {};
-    int pcie_num[kMax] = {};
-};
-void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
-    SplitDrive* s = (SplitDrive*) user;
-    int st = 0;
-    while (st + 1 < s->n && layer >= s->end[st]) ++st;
-    Drive& d = *s->base;
-    d.d.plan = s->plan[st];
-    d.d.cache_base = s->cache_base[st];
-    d.d.cache_slot_off = s->cache_slot_off[st];
-    d.d.pcie_num = s->pcie_num[st];
-    drive_pool_multi(s->base, x_f, ids, n_tok, k, out, layer);
-}
-
-/// Layer split across GPUs: a later stage on its own device, with its own copy of the dense weights, a session, an
-/// expert cache for its layers, a verify window and a prompt path; the last one also holds the head (the drafter
-/// lives on its device too).
-struct GpuStage {
-    int dev = 0;
-    int64_t lb = 0, le = 0;
-    double pcie_frac = 0.0;
-    double link_gbps = 0.0;   ///< this card's probed host->device bandwidth (PcieAuto's per-stage share)
-    strata::core::WeightTable wt;
-    strata::core::NativeDense dense;
-    strata::core::NativeHead head;
-    strata::core::SessionState ss;
-    cudaStream_t stream = nullptr;
-    strata::core::ExpertCache cache;
-    std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
-    int32_t* d_res = nullptr;                            ///< the residency table on its device
-    strata::core::Verifier ver;
-    strata::core::Verifier ver_b;                        ///< --pipeline-windows: the odd windows' verifier
-    strata::prefill::Prefill sp;
-    cudaStream_t adapt_stream = nullptr;
-    cudaEvent_t adapt_ev = nullptr;
-    bool adapt_live = false;                             ///< swaps of this request are in flight on it
-    int32_t* mrope = nullptr;                            ///< --vision: the image-position table on its device
-};
 
 // what a refusal on the RAM guard says it had: "900 MiB available, source cgroup" (the smallest of MemAvailable, the
 // cgroup limits above the engine and --memory-limit-mib; see strata/core/conversation_memory.hpp)
@@ -2636,6 +2544,9 @@ int main(int argc, char** argv) {
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
+        else if (a == "--rpc-listen") o.rpc_listen = next("--rpc-listen");
+        else if (a == "--rpc-connect") o.rpc_connect = next("--rpc-connect");
+        else if (a == "--rpc-layer-range") o.rpc_range = next("--rpc-layer-range");
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
@@ -2982,7 +2893,52 @@ int main(int argc, char** argv) {
     const bool pcie_given = o.pcie_frac >= 0.0;
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
-    bool split_auto = false, split_same = false;
+    bool split_auto = false, split_same = false, split_same_stages = false;
+    o.rpc_worker = !o.rpc_listen.empty();
+    const bool rpc_mode = o.rpc_worker || !o.rpc_connect.empty();
+    if (!o.rpc_listen.empty() && !o.rpc_connect.empty()) {
+        std::fprintf(stderr, "strata generate: --rpc-listen and --rpc-connect are for different processes\n");
+        return 2;
+    }
+    if (rpc_mode && o.rpc_range.empty()) {
+        std::fprintf(stderr, "strata generate: %s needs --rpc-layer-range LO:HI\n",
+                     o.rpc_worker ? "--rpc-listen" : "--rpc-connect");
+        return 2;
+    }
+    if (rpc_mode && !o.serve) {
+        std::fprintf(stderr, "strata generate: RPC stage options need --serve\n");
+        return 2;
+    }
+    if (rpc_mode && !o.layer_split.empty()) {
+        std::fprintf(stderr, "strata generate: --layer-split and RPC stage options cannot be combined\n");
+        return 2;
+    }
+    if (rpc_mode && o.batch > 0) {
+        std::fprintf(stderr, "strata generate: RPC stages do not support --batch/--slots yet\n");
+        return 2;
+    }
+    if (rpc_mode && o.vision) {
+        std::fprintf(stderr, "strata generate: RPC stages do not support images yet\n");
+        return 2;
+    }
+    if (rpc_mode) {
+        // The same-backend RPC gate is bit-exact.  Tail skipping is an approximate decode optimization whose result
+        // depends on the window size; two processes can choose different MTP windows, so it would break that gate.
+#if defined(_WIN32)
+        _putenv_s("STRATA_ROUTE_TAIL_SKIP", "0");
+#else
+        setenv("STRATA_ROUTE_TAIL_SKIP", "0", 1);
+#endif
+        std::fprintf(stderr, "strata generate: RPC stage: STRATA_ROUTE_TAIL_SKIP is off (exact decode gate)\n");
+    }
+    if (o.rpc_worker) {
+        // The prefix worker has no head, sampler or drafter: tokens and positions are its only inputs.  Keep --spec
+        // for the native-pack startup contract; only the drafter and suffix-draft sources are disabled.
+        o.mtp.clear();
+        o.spec_min_p = 0.0;
+        o.suffix_draft = 0;
+        o.lookup_chain = 0;
+    }
     if (!o.layer_split.empty()) {
         int n_dev = 1;
         if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev < 1) n_dev = 1;
@@ -3006,7 +2962,16 @@ int main(int argc, char** argv) {
         else if (ok)
             for (int d = 1; d < n_dev && (split_auto || split_devs.size() < split_at.size()); ++d) split_devs.push_back(d);
         if (ok && !split_auto && split_devs.empty() && split_at.size() == 1) split_devs.push_back(0);   // one GPU
-        split_same = ok && split_devs.size() == 1 && split_devs[0] == 0 && !split_auto;
+        // Diagnostic baseline for RPC parity: force a real GpuStage with its own cache even when the requested
+        // later stage is device 0, so a single-card host can compare against the same per-stage cache partition.
+        split_same_stages = [] {
+            const char* v = std::getenv("STRATA_SPLIT_SAME_STAGES");
+            return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+        }();
+        split_same = ok && split_devs.size() == 1 && split_devs[0] == 0 && !split_auto && !split_same_stages;
+        if (split_same_stages)
+            std::fprintf(stderr, "strata generate: STRATA_SPLIT_SAME_STAGES: a real second GpuStage on CUDA0 (parity "
+                                 "diagnostic; default is the shared-weight same-device split)\n");
         if (split_same && o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0) {
             std::fprintf(stderr, "strata serve: conversation parking does not support a layer split on one GPU "
                                  "(--split-device 0); disable parking with --conversation-cache-mib 0\n");
@@ -3020,7 +2985,7 @@ int main(int argc, char** argv) {
             ok = (split_auto || split_at.size() == split_devs.size()) && split_devs.size() < (size_t) SplitDrive::kMax;
             for (size_t i = 0; ok && i < split_at.size(); ++i) ok = split_at[i] >= 2 && (i == 0 || split_at[i] > split_at[i - 1]);
             for (size_t i = 0; ok && !split_same && i < split_devs.size(); ++i) {
-                ok = split_devs[i] > 0 && split_devs[i] < n_dev;
+                ok = (split_same_stages || split_devs[i] > 0) && split_devs[i] >= 0 && split_devs[i] < n_dev;
                 for (size_t j = 0; ok && j < i; ++j) ok = split_devs[i] != split_devs[j];
             }
         }
@@ -3799,6 +3764,105 @@ int main(int argc, char** argv) {
         if (!o.native_dense_gguf.empty() && !multi_gpu && strata::core::NativeDense::hc_q8_requested())
             strata::core::NativeDense::add_hc_skip(o.pack, skip);
     }
+    // RPC stage ranges are explicit and must be the two halves of the model: a prefix worker [0,K) and a controller
+    // suffix [K,n_layers).  The model geometry is known here, after the geometry check and before any weight moves.
+    if (rpc_mode) {
+        const std::size_t colon = o.rpc_range.find(':');
+        char* end_lo = nullptr;
+        char* end_hi = nullptr;
+        const long long lo = colon == std::string::npos ? -1 : std::strtoll(o.rpc_range.c_str(), &end_lo, 10);
+        const bool open_hi = colon != std::string::npos && o.rpc_range.substr(colon + 1) == "?";
+        const long long hi = open_hi || colon == std::string::npos
+                                 ? -1
+                                 : std::strtoll(o.rpc_range.c_str() + colon + 1, &end_hi, 10);
+        if (colon == std::string::npos || end_lo != o.rpc_range.c_str() + colon ||
+            (!open_hi && (end_hi == o.rpc_range.c_str() + colon + 1 || *end_hi != '\0'))) {
+            std::fprintf(stderr, "strata generate: --rpc-layer-range must be LO:HI (HI may be ?), got '%s'\n",
+                         o.rpc_range.c_str());
+            return 2;
+        }
+        o.rpc_lo = lo;
+        o.rpc_hi = hi < 0 ? g.n_layers : hi;
+        if (o.rpc_hi <= o.rpc_lo || o.rpc_lo < 0 || o.rpc_hi > g.n_layers) {
+            std::fprintf(stderr, "strata generate: --rpc-layer-range %s is outside this model's %lld layers\n",
+                         o.rpc_range.c_str(), (long long) g.n_layers);
+            return 2;
+        }
+        if (o.rpc_worker && (o.rpc_lo != 0 || o.rpc_hi >= g.n_layers)) {
+            std::fprintf(stderr, "strata generate: a prefix worker must own [0,K) with K < %lld layers\n",
+                         (long long) g.n_layers);
+            return 2;
+        }
+        if (!o.rpc_worker && (o.rpc_lo <= 0 || o.rpc_hi != g.n_layers)) {
+            std::fprintf(stderr, "strata generate: an RPC controller must own [K,%lld) with K > 0\n",
+                         (long long) g.n_layers);
+            return 2;
+        }
+        if (o.rpc_worker) {
+            // The prefix has no prompt path or drafter of its own; WINDOW/COMMIT are its only work.  Keep a small
+            // valid prompt chunk because the native-pack serve gate and buffer pricing require one.
+            o.prefill_auto = false;
+            o.prefill_chunk = std::min<int64_t>(512, std::max<int64_t>(1, o.max_context));
+            o.short_read = 0;
+        } else {
+            // Task 7 is the decode vertical slice: read the prompt through verify windows too, never the local
+            // prefill chain (that boundary is Task 8/9).
+            o.short_read = o.max_context;
+            o.pipeline_windows = 0;
+        }
+    }
+    std::unique_ptr<strata::rpc::ControlChannel> rpc_control;
+    if (rpc_mode) {
+        const char* token_env = std::getenv("STRATA_RPC_TOKEN");
+        const std::string token = token_env != nullptr ? token_env : "";
+        if (token.empty()) {
+            std::fprintf(stderr, "strata generate: RPC stage has no STRATA_RPC_TOKEN\n");
+            return 2;
+        }
+        if (o.rpc_worker) {
+            rpc_control = strata::rpc::ControlChannel::worker_listen(o.rpc_listen, token,
+                                                                     strata::rpc::kDefaultBulkBytes, err, 3600000);
+            if (!rpc_control) {
+                std::fprintf(stderr, "strata generate: RPC worker listen: %s\n", err.c_str());
+                return 1;
+            }
+            if (!rpc_control->receive_bulk(err)) {
+                std::fprintf(stderr, "strata generate: RPC worker bulk hand-off: %s\n", err.c_str());
+                return 1;
+            }
+        } else {
+            const char* fd_env = std::getenv("STRATA_RPC_SOCKET_FD");
+            if (fd_env != nullptr && fd_env[0] != '\0') {
+                char* end = nullptr;
+                const long fd = std::strtol(fd_env, &end, 10);
+                if (end == fd_env || *end != '\0' || fd < 0 || fd > 1 << 20) {
+                    std::fprintf(stderr, "strata generate: STRATA_RPC_SOCKET_FD is not a socket descriptor\n");
+                    return 2;
+                }
+                rpc_control = strata::rpc::ControlChannel::controller_adopt((int) fd, strata::rpc::kDefaultBulkBytes,
+                                                                            err, 3600000);
+            } else {
+                rpc_control = strata::rpc::ControlChannel::controller_connect(o.rpc_connect, token,
+                                                                              strata::rpc::kDefaultBulkBytes,
+                                                                              err, 3600000);
+            }
+            if (!rpc_control) {
+                std::fprintf(stderr, "strata generate: RPC controller hand-off: %s\n", err.c_str());
+                return 1;
+            }
+            strata::rpc::WorkerInit init;
+            init.layer_begin = 0;
+            init.layer_end = (uint32_t) o.rpc_lo;   // the prefix worker's range: [0,K)
+            init.handoff_floats = (uint32_t) strata::core::Verifier::handoff_floats(g);
+            init.max_window = (uint32_t) strata::kernels::kVerifyMaxT;
+            init.max_context = (uint64_t) o.max_context;
+            if (!rpc_control->send_request(strata::rpc::Opcode::InitStage,
+                                           strata::rpc::encode_worker_init(init), err)) {
+                std::fprintf(stderr, "strata generate: RPC INIT_STAGE: %s\n", err.c_str());
+                return 1;
+            }
+        }
+    }
     // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).
     // Without this each card keeps a full copy (~3.4 GB for the Coder) that its stage never reads - VRAM the
     // expert cache wants.  Opt-in, STRATA_STAGE_TRIM=1, on HIP and CUDA alike: measured on 2x MI50 (PR #639),
@@ -3815,9 +3879,13 @@ int main(int argc, char** argv) {
     // the device with the most room, and on the 4-way IQ3_S rig the trim buys it 4598 -> 4608 slots.  The VRAM
     // is on the later cards (CUDA2 1241 -> 2485, CUDA3 533 -> 1772), and THEIR weights load after the search,
     // so they trim under `auto` too - see the block past it.
-    const bool stage_trim = trim_asked && multi_gpu && !split_auto && !split_at.empty();
-    if (o.trim_stage_weights && !multi_gpu)
+    const bool stage_trim = (trim_asked || rpc_mode) &&
+                            ((multi_gpu && !split_auto && !split_at.empty()) || rpc_mode);
+    if (o.trim_stage_weights && !multi_gpu && !rpc_mode)
         std::fprintf(stderr, "strata generate: --trim-stage-weights needs a layer split across GPUs (ignored)\n");
+    if (rpc_mode)
+        std::fprintf(stderr, "strata generate: RPC stage: loading only layers %lld-%lld (weight trimming is mandatory)\n",
+                     (long long) o.rpc_lo, (long long) o.rpc_hi - 1);
     // Only `--layer-split auto` WITH the trim asked loads the later stages' weights after the split search (they can
     // only be trimmed once the split is known).  Every other run keeps the 0.1.39 order: weights first, then the
     // search - so without the trim nothing about a split moves.
@@ -3840,10 +3908,13 @@ int main(int argc, char** argv) {
         std::fclose(f);
     };
     if (stage_trim) {
-        add_foreign(0, split_at[0], skip, o.mmap_experts);
-        strata::core::NativeDense::set_layer_range(0, (int) split_at[0]);
-        std::fprintf(stderr, "strata generate: layer split: CUDA0 loads the dense weights of layers 0-%lld only\n",
-                     (long long) split_at[0] - 1);
+        const int64_t lb = rpc_mode ? o.rpc_lo : 0;
+        const int64_t le = rpc_mode ? o.rpc_hi : split_at[0];
+        add_foreign(lb, le, skip, o.mmap_experts);
+        if (rpc_mode && o.rpc_worker) skip.insert("output.weight");   // the controller owns head and MTP
+        strata::core::NativeDense::set_layer_range((int) lb, (int) le);
+        std::fprintf(stderr, "strata generate: %s: this stage loads the dense weights of layers %lld-%lld only\n",
+                     rpc_mode ? "RPC stage" : "layer split", (long long) lb, (long long) le - 1);
     }
     // STRATA_HC_REQ8=1 (opt-in, changes the output): the hyper-connection projections are not loaded as BF16;
     // load_hc_q8 below requantizes them to int8 + an fp32 scale per 32 values (~0.56x the bytes), and the freed VRAM
@@ -4349,7 +4420,8 @@ int main(int argc, char** argv) {
         GpuStage& st = *stages.back();
         st.dev = split_devs[i];
         double free_gib = 0;
-        if (!strata::core::RemoteExperts::preflight(st.dev, free_gib, err)) {
+        if (!(split_same_stages && st.dev == primary_device) &&
+            !strata::core::RemoteExperts::preflight(st.dev, free_gib, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -5141,16 +5213,34 @@ int main(int argc, char** argv) {
             return 2;
         }
     // the stage that runs a layer (0: CUDA0's)
-    auto stage_of = [&](int64_t l) -> int {
-        int st = 0;
-        while (st < (int) split_at.size() && l >= split_at[(size_t) st]) ++st;
-        return st;
-    };
+    auto stage_of = [&](int64_t l) -> int { return stage_for_layer(l, split_at); };
     // the whole ranking, hottest first, before each stage takes its own layers' share: the resident RAM copy ranks
     // the experts no GPU holds over ALL the layers (with CUDA0's share alone, a copy that did not fit kept only layers
     // 0..K-1's experts and read every later layer's from the files)
     std::vector<std::pair<int32_t, int32_t>> profile_all;
-    if (multi_gpu) {
+    auto profile_hash = [](const std::vector<std::pair<int32_t, int32_t>>& v) {
+        uint64_t h = 1469598103934665603ull;
+        for (const auto& p : v) {
+            const uint32_t fields[2] = {(uint32_t) p.first, (uint32_t) p.second};
+            h = (h ^ fields[0]) * 1099511628211ull;
+            h = (h ^ fields[1]) * 1099511628211ull;
+        }
+        return h;
+    };
+    if (rpc_mode) {
+        // One process owns one layer range: its cache fill must contain exactly that range's hottest pairs, or the
+        // GPU/CPU split of the same expert would differ from the in-process stage it replaces.
+        profile_all = profile;
+        std::vector<std::pair<int32_t, int32_t>> mine;
+        for (const auto& pr : profile)
+            if (pr.first >= o.rpc_lo && pr.first < o.rpc_hi) mine.push_back(pr);
+        profile.swap(mine);
+        std::fprintf(stderr, "strata generate: RPC stage: %zu profiled expert pairs belong to layers %lld-%lld\n",
+                     profile.size(), (long long) o.rpc_lo, (long long) o.rpc_hi - 1);
+        if (std::getenv("STRATA_RPC_TRACE_PROFILE") != nullptr)
+            std::fprintf(stderr, "RPC trace: profile hash %016llx (%zu)\n", (unsigned long long) profile_hash(profile),
+                         profile.size());
+    } else if (multi_gpu) {
         profile_all = profile;
         std::vector<std::pair<int32_t, int32_t>> mine;
         for (const auto& pr : profile) {
@@ -5158,6 +5248,13 @@ int main(int argc, char** argv) {
             (st == 0 ? mine : stages[(size_t) st - 1]->profile).push_back(pr);
         }
         profile.swap(mine);
+        if (std::getenv("STRATA_RPC_TRACE_PROFILE") != nullptr) {
+            std::fprintf(stderr, "RPC trace: profile hash stage 0 %016llx (%zu)\n",
+                         (unsigned long long) profile_hash(profile), profile.size());
+            for (size_t i = 0; i < stages.size(); ++i)
+                std::fprintf(stderr, "RPC trace: profile hash stage %zu %016llx (%zu)\n", i + 1,
+                             (unsigned long long) profile_hash(stages[i]->profile), stages[i]->profile.size());
+        }
         for (size_t i = 0; i < stages.size(); ++i) {
             stages[i]->lb = split_at[i];
             stages[i]->le = i + 1 < stages.size() ? split_at[i + 1] : g.n_layers;
@@ -5197,7 +5294,8 @@ int main(int argc, char** argv) {
     // fixed in llama.cpp: allocation sized by the whole model instead of the device's own work.
     {
         const strata::core::OnDevice on0(primary_device);   // STRATA_PRIMARY_DEVICE (upstream: a literal 0)
-        const int64_t hi0 = multi_gpu ? split_at[0] : -1;
+        const int64_t lo0 = rpc_mode ? o.rpc_lo : 0;
+        const int64_t hi0 = rpc_mode ? o.rpc_hi : multi_gpu ? split_at[0] : -1;
         // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming), a profiled cache
         // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up
         {
@@ -5217,11 +5315,11 @@ int main(int argc, char** argv) {
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
         }
-        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
+        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, lo0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
-        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
+        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, lo0, hi0) == 0) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
@@ -5249,6 +5347,16 @@ int main(int argc, char** argv) {
         }
     }
     mem_mark("the session (KV, GDN state, PLE history)");
+    float* rpc_handoff = nullptr;
+    if (rpc_mode) {
+        const size_t bytes = (size_t) strata::kernels::kVerifyMaxT *
+                             (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+        if (cudaHostAlloc((void**) &rpc_handoff, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: RPC hand-off staging buffer failed%s\n", vram_free_note().c_str());
+            return 1;
+        }
+        std::memset(rpc_handoff, 0, bytes);
+    }
     for (size_t i = 0; i < stages.size(); ++i) {
         GpuStage& st = *stages[i];
         const strata::core::OnDevice on(st.dev);
@@ -5555,10 +5663,10 @@ int main(int argc, char** argv) {
     // arena registers tens of GiB of host pages, like the drafter above - WDDM then refused the head's cudaMalloc on
     // a 16 GB card with the desktop on the iGPU ("native head upload: out of memory" with GiBs free).
     const strata::core::WeightRef* wo = wt.find("output.weight");
-    if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
-    const int64_t n_vocab = wo->ne1;
+    if (wo == nullptr && !o.rpc_worker) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
+    const int64_t n_vocab = wo != nullptr ? wo->ne1 : g.n_vocab;
     strata::core::NativeHead native_head;
-    if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
+    if (!o.rpc_worker && !o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
         if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
@@ -6311,7 +6419,21 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: uniform expert slots, no guard (STRATA_MMQ_DIRECT): an expert is read "
                                  "in its slot where the slot's slack covers the over-read\n");
     }
+    const int64_t cache_slots_cap = [] {
+        const char* v = std::getenv("STRATA_RPC_CACHE_SLOTS_CAP");
+        if (v == nullptr || v[0] == '\0') return (int64_t) -1;
+        const long long n = std::atoll(v);
+        return n > 0 ? (int64_t) n : (int64_t) -1;
+    }();
     if (o.expert_cache > 0) {
+        if (cache_slots_cap > 0) {
+            if (!sized_slots.empty() && (int64_t) sized_slots.size() > cache_slots_cap)
+                sized_slots.resize((size_t) cache_slots_cap);
+            o.expert_cache = sized_slots.empty() ? (int) std::min<int64_t>(o.expert_cache, cache_slots_cap)
+                                                 : (int) sized_slots.size();
+            std::fprintf(stderr, "strata generate: STRATA_RPC_CACHE_SLOTS_CAP=%lld: %d cache slots\n",
+                         (long long) cache_slots_cap, o.expert_cache);
+        }
         // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
         auto shrink_to = [&](int64_t keep_bytes) -> bool {
             if (keep_bytes <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
@@ -6540,6 +6662,20 @@ int main(int argc, char** argv) {
         }
     }
 
+    auto cache_slot_hash = [&](const strata::core::ExpertCache& c) {
+        uint64_t h = 1469598103934665603ull;
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                const int32_t s = c.slot_of(l, e);
+                h = (h ^ (uint32_t) l) * 1099511628211ull;
+                h = (h ^ (uint32_t) e) * 1099511628211ull;
+                h = (h ^ (uint32_t) s) * 1099511628211ull;
+            }
+        return h;
+    };
+    if (std::getenv("STRATA_RPC_TRACE_PROFILE") != nullptr)
+        std::fprintf(stderr, "RPC trace: cache slot hash main %016llx (%lld slots)\n",
+                     (unsigned long long) cache_slot_hash(xcache), (long long) xcache.slots());
     for (auto& stp : stages) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -6562,6 +6698,8 @@ int main(int argc, char** argv) {
             used += b;
             sized.push_back((int64_t) lay.blob_bytes(pr.first));
         }
+        if (cache_slots_cap > 0 && (int64_t) sized.size() > cache_slots_cap)
+            sized.resize((size_t) cache_slots_cap);
         // #841: a stage's cache can fail to open with the VRAM free (the card's allocation is also charged to the
         // Windows commit, or the free figure ran high): it is tried again with 90% of the slots, up to 3 times, each
         // try said.  Nothing changes when the first open works.
@@ -6608,6 +6746,9 @@ int main(int argc, char** argv) {
                              "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified\n",
                      st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),
                      (long long) filled, st.profile.size());
+        if (std::getenv("STRATA_RPC_TRACE_PROFILE") != nullptr)
+            std::fprintf(stderr, "RPC trace: cache slot hash stage CUDA%d %016llx (%lld slots)\n", st.dev,
+                         (unsigned long long) cache_slot_hash(st.cache), (long long) st.cache.slots());
     }
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
@@ -7410,13 +7551,19 @@ int main(int argc, char** argv) {
     const bool graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool;
     if (graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr) {
         host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
+        // Diagnostic only: keep the cache allocated (the verifier needs a valid cache base) but make every expert a
+        // CPU miss, so an RPC parity run cannot be moved by a one-slot cache placement difference.
+        const bool force_cpu_experts = [] {
+            const char* v = std::getenv("STRATA_RPC_FORCE_CPU_EXPERTS");
+            return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+        }();
         int64_t resident = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
                 const int st = multi_gpu ? stage_of(l) : 0;
                 const int32_t slot = st > 0 ? stages[(size_t) st - 1]->cache.slot_of(l, e) : xcache.slot_of(l, e);
-                host_res[(size_t) (l * g.n_expert + e)] = slot;
-                if (slot != strata::core::kNotResident) ++resident;
+                host_res[(size_t) (l * g.n_expert + e)] = force_cpu_experts ? strata::core::kNotResident : slot;
+                if (!force_cpu_experts && slot != strata::core::kNotResident) ++resident;
             }
         if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_count, sizeof(int32_t)) != cudaSuccess ||
@@ -9190,8 +9337,18 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+        if (rpc_mode) {
+            std::fprintf(stderr, "strata generate: RPC verify setup: %s stage [%lld,%lld), cache %lld slots, "
+                                 "profile %zu, d_res %s, hit %s\n", o.rpc_worker ? "worker" : "controller",
+                         (long long) o.rpc_lo, (long long) o.rpc_hi, (long long) xcache.slots(), profile.size(),
+                         thits.d_res != nullptr ? "yes" : "no", hit_fn != nullptr ? "yes" : "no");
+            ver.set_stage(o.rpc_lo, o.rpc_hi, o.rpc_worker ? nullptr : rpc_handoff,
+                          o.rpc_worker ? rpc_handoff : nullptr);
+        }
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
+                      rpc_mode ? (int) strata::kernels::kVerifyMaxT
+                               : batch_mtp ? strata::kernels::kVerifyMaxT
+                                           : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -9254,6 +9411,48 @@ int main(int argc, char** argv) {
         const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
         mem_mark("the verifier and the drafter's binding");
+        std::unique_ptr<RpcPrefixStage> rpc_prefix;
+        strata::core::DecodeStage* decode_head = &ver;
+        if (rpc_mode) {
+            const std::uint64_t handoff_floats = (std::uint64_t) strata::core::Verifier::handoff_floats(g);
+            const std::uint64_t handoff_bytes = (std::uint64_t) strata::kernels::kVerifyMaxT * handoff_floats *
+                                                sizeof(float);
+            if (o.rpc_worker) {
+                struct WorkerStage final : RpcWorkerStage {
+                    strata::core::Verifier& verifier;
+                    strata::core::PoolMultiFn pool;
+                    void* user;
+                    WorkerStage(strata::core::Verifier& v, strata::core::PoolMultiFn p, void* u)
+                        : verifier(v), pool(p), user(u) {}
+                    bool run_window(int T, const int32_t* tokens, int64_t pos0, int32_t* out,
+                                    std::string& error) override {
+                        return verifier.run_decode_window(T, tokens, pos0, pool, user, out, error);
+                    }
+                    bool commit_window(uint32_t keep, std::string& error) override {
+                        return verifier.commit_decode_prefix((int) keep, error);
+                    }
+                } worker_stage(ver, win_pool_fn, win_pool_user);
+                strata::rpc::WorkerInit expected;
+                expected.layer_begin = (uint32_t) o.rpc_lo;
+                expected.layer_end = (uint32_t) o.rpc_hi;
+                expected.handoff_floats = (uint32_t) handoff_floats;
+                expected.max_window = (uint32_t) strata::kernels::kVerifyMaxT;
+                expected.max_context = (uint64_t) o.max_context;
+                std::string rpc_err;
+                const int rc = run_rpc_worker(*rpc_control, expected, rpc_handoff, handoff_bytes, worker_stage, rpc_err);
+                if (rc != 0) std::fprintf(stderr, "strata generate: RPC worker: %s\n", rpc_err.c_str());
+                return rc;
+            }
+            rpc_prefix = std::make_unique<RpcPrefixStage>(std::move(rpc_control), ver, rpc_handoff, handoff_bytes,
+                                                          handoff_floats, (int) strata::kernels::kVerifyMaxT);
+            if (!rpc_prefix->wait_ready(err)) {
+                std::fprintf(stderr, "strata generate: RPC prefix READY: %s\n", err.c_str());
+                return 1;
+            }
+            decode_head = rpc_prefix.get();
+            std::fprintf(stderr, "strata generate: RPC prefix READY; controller runs layers %lld-%lld and the head\n",
+                         (long long) o.rpc_lo, (long long) o.rpc_hi - 1);
+        }
         ver.set_split(o.spec_split);
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
@@ -11584,6 +11783,11 @@ int main(int argc, char** argv) {
             }
             if (batch_mtp && A > 0) next_slot = ((size_t) active[A - 1] + 1) % bs.size();
             if (S == 0) return true;
+            if (!decode_head->supports_batch_decode()) {
+                err = "this decode stage does not support batch windows";
+                std::printf("ERR %s\n", err.c_str());
+                return false;
+            }
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
             drive.d.layers = 0;
@@ -11616,7 +11820,8 @@ int main(int argc, char** argv) {
                 bt_a_rounds0 = a_rounds; bt_a_swapped0 = a_swapped;
             }
             const Clock::time_point w0 = Clock::now();
-            if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
+            if (!decode_head->run_batch_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) ||
+                drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
             }
@@ -11643,7 +11848,8 @@ int main(int argc, char** argv) {
                 keep[b] = batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
             }
-            if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
+            if (!(batch_mtp ? decode_head->commit_batch_slot_prefixes(keep.data(), err)
+                            : decode_head->commit_batch_slots(err))) {
                 std::printf("ERR %s\n", err.c_str());
                 return false;
             }
@@ -13252,7 +13458,8 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
-                    if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
+                    if (!decode_head->run_decode_window(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) ||
+                        drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
@@ -13274,7 +13481,9 @@ int main(int argc, char** argv) {
                     }();
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
-                    if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
+                    if (!decode_head->commit_decode_prefix(T, e) ||
+                        (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)))
+                        return false;
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
@@ -14225,7 +14434,7 @@ int main(int argc, char** argv) {
             std::vector<int32_t> cbuf((size_t) S, 0), ctail;
             strata::spec::PromptLookupSource lookup_src(sfx);
             static const bool chain_fixed = std::getenv("STRATA_LOOKUP_CHAIN_FIXED") != nullptr;   // no policy gate
-            int64_t draft_offered = 0, draft_accepted = 0;
+            int64_t draft_offered = 0, draft_accepted = 0, corrupt_counter = 0;
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
@@ -14963,6 +15172,10 @@ int main(int argc, char** argv) {
                                          : from_sfx ? sbuf[(size_t) i - 1]
                                                     : drafts[(size_t) i - 1];
                 for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
+                if (o.spec_corrupt > 0)
+                    for (int i = 1; i < T; ++i)
+                        if ((++corrupt_counter % o.spec_corrupt) == 0)
+                            window[(size_t) i] = (window[(size_t) i] + 1) % (int32_t) n_vocab;
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
@@ -15125,7 +15338,8 @@ int main(int argc, char** argv) {
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 // (never on a first window: a merged one holds prompt tokens, not drafts)
                 if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
-                if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
+                if (!decode_head->run_decode_window(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) ||
+                    drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
@@ -15160,7 +15374,7 @@ int main(int argc, char** argv) {
                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
                 if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_iv(rounds)) == 0)
                     adapt_thr = std::thread([&] { strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
-                if (!ver.commit(a + 1, err)) {
+                if (!decode_head->commit_decode_prefix(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
@@ -16669,7 +16883,7 @@ int main(int argc, char** argv) {
             if (adapt_nowait()) apply_pending(false);
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
-            if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
+            if (!ver.run_decode_window(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 // The graph of a window size is captured the first time it is used, and the draft source took VRAM: when the capture runs
                 // out of memory the window gets one row narrower (the widths below it are already captured) instead of the run failing.
                 if (T > 2 && !first_window && err.find("out of memory") != std::string::npos) {
@@ -16729,7 +16943,7 @@ int main(int argc, char** argv) {
             if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_iv(rounds)) == 0)
                 adapt_thr = std::thread([&] { strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
             strata::core::progress_at("spec loop: commit", (int64_t) T);
-            if (!ver.commit(a + 1, err)) {
+            if (!ver.commit_decode_prefix(a + 1, err)) {
                 if (adapt_thr.joinable()) adapt_thr.join();
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;

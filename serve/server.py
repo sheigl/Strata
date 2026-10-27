@@ -75,9 +75,11 @@ from strata_control import draft_layer  # noqa: E402
 from strata_control import drafting  # noqa: E402
 from strata_control import user_args  # noqa: E402
 from strata_control import gpu_roles  # noqa: E402
+from strata_control import rpc_config  # noqa: E402
 from serve import ready as ready_file  # noqa: E402
 from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
+from serve import rpc_workers  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -982,8 +984,9 @@ class StrataEngine:
             tl.last = value
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
-        self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
+                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0,
+                 pass_fds: tuple[int, ...] | None = None):
+        self.spawn = (exe, list(args), cwd, log, env, False, cpus, 0, pass_fds)   # to start it again (issue #27)
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -1041,9 +1044,11 @@ class StrataEngine:
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
         spawned_at = time.monotonic()
         try:
-            self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
-                              **pin)
+            popen_kw = dict(cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, text=True,
+                            encoding="utf-8", bufsize=1, env=env, **pin)
+            if pass_fds:
+                popen_kw["pass_fds"] = tuple(pass_fds)
+            self.proc = popen("the Strata engine", [exe, "--serve", *args], **popen_kw)
         except OSError:                                  # nothing started: the narrator stops, the log handle goes back
             loading.set()
             if log:
@@ -3038,6 +3043,16 @@ def layer_split_value(cfg: dict) -> str:
     if vals[0] < 2 or any(b <= a for a, b in zip(vals, vals[1:])):
         raise ValueError(f"{hint}; got {v!r}, which does not rise from 2 or more")
     return ",".join(str(x) for x in vals)
+
+
+def apply_rpc_split_config(cfg: dict) -> dict | None:
+    """Validate an opt-in "rpc_split" section before any process is started; None leaves the normal path alone.
+
+    This task deliberately establishes the configuration gate and generated internal arguments without starting a
+    worker.  Task 4 connects the plan to RpcWorkerSupervisor.  A bad combination is ValueError, which the startup
+    path turns into a plain SystemExit before model loading.
+    """
+    return rpc_config.validate_rpc_split(cfg)
 
 
 def apply_ready_timeout(cfg: dict) -> None:
@@ -8353,6 +8368,14 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
+        try:
+            rpc_split = apply_rpc_split_config(cfg)
+        except ValueError as e:
+            raise SystemExit(f"[strata] config {e}")
+        if rpc_split is not None:
+            worker = rpc_split["worker"]
+            print(f'[strata] rpc_split: worker "{worker["id"]}" ({worker["backend"]}, GPU {worker["device"]}) runs layers '
+                  f'0-{rpc_split["boundary"]}; the controller owns its suffix, head, sampling, and MTP', flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
         for line in card_roles_lines(cfg):             # the card roles: said first; every card Off stops here, before anything touches a card
             print(line, flush=True)
@@ -8375,7 +8398,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                             env=vision_env(cfg, env), lazy=lazy)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
-        warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
+        base_engine_args = engine_args(cfg) if "args" in cfg else []      # #1080
+        warn_budget_over_ram(base_engine_args)
         note = card_note(cfg, env)
         if note:
             print(note, flush=True)
@@ -8411,11 +8435,49 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             groups = rp.gpu_groups(cfg)
         except rp.ReplicaConfigError as e:
             raise SystemExit(f"[strata] config {e}")
+        rpc_worker = None
+        rpc_fd = None
+        if rpc_split is not None:
+            if lazy:
+                raise SystemExit("[strata] rpc_split needs a model loaded at start; lazy_load is not supported yet")
+            if groups:
+                raise SystemExit("[strata] rpc_split and GPU replicas cannot be combined")
+            try:
+                rpc_worker = rpc_workers.RpcWorkerSupervisor(
+                    rpc_split, base_engine_args=base_engine_args, cwd=cfg.get("cwd"),
+                    log_path=cfg.get("log"), ready_timeout_s=float(cfg.get("rpc_ready_s") or 900.0))
+                rpc_worker.start()
+                import atexit
+                atexit.register(rpc_worker.shutdown)
+                print(f"[strata] RPC worker {rpc_worker.plan['worker']['id']!r} is ready at {rpc_worker.socket_path}",
+                      flush=True)
+            except (rpc_workers.RpcWorkerError, OSError, ValueError) as e:
+                raise SystemExit(f"[strata] rpc_split worker could not start: {e}")
         if groups:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline)
         else:
-            engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                                  env=env, lazy=lazy)
+            controller_args = (rpc_worker.controller_args() if rpc_worker is not None else [])
+            controller_env = env
+            pass_fds = ()
+            if rpc_worker is not None:
+                try:
+                    rpc_fd = rpc_worker.hand_off_socket()
+                except (rpc_workers.RpcWorkerError, OSError) as e:
+                    raise SystemExit(f"[strata] rpc_split controller hand-off failed: {e}")
+                controller_env = dict(env)
+                controller_env["STRATA_RPC_SOCKET_FD"] = str(rpc_fd)
+                controller_env["STRATA_RPC_TOKEN"] = rpc_worker.token
+                pass_fds = (rpc_fd,)
+            try:
+                engine = StrataEngine(exe, base_engine_args + (effort_end or []) + controller_args,
+                                      cwd=cfg.get("cwd"), log=cfg.get("log"), env=controller_env, lazy=lazy,
+                                      pass_fds=pass_fds)
+            finally:
+                if rpc_fd is not None:
+                    try:
+                        os.close(rpc_fd)
+                    except OSError:
+                        pass
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],

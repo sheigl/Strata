@@ -23,6 +23,7 @@
 
 #include <cstdio>
 
+#include "strata/core/decode_stage.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
@@ -63,10 +64,6 @@ struct AdaptGate {
 class NativeHead;
 class RemoteExpertOpt;
 
-/// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), hit rows zeroed.
-using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                             int64_t layer);
-
 struct VerifyHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
     const int32_t* h_res = nullptr;      ///< host [n_layers * n_expert] slot or -1 (when all >= 0 in stage: zero-doorbell)
@@ -76,10 +73,10 @@ struct VerifyHits {
     int64_t blob = 0;
 };
 
-class Verifier {
+class Verifier : public DecodeStage {
 public:
     Verifier() = default;
-    ~Verifier();
+    ~Verifier() override;
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
@@ -103,6 +100,10 @@ public:
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    bool run_decode_window(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
+                           std::string& err) override {
+        return run(T, tokens, pos0, pool, user, out, err);
+    }
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
@@ -195,6 +196,7 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    bool commit_decode_prefix(int n_keep, std::string& err) override { return commit(n_keep, err); }
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
@@ -222,6 +224,17 @@ public:
     /// Commit an accepted prefix in each contiguous slot group of the last window. `keep` has
     /// one entry per slot (indexed by slot ID), each in 1..that slot's group length.
     bool commit_slot_prefixes(const int* keep, std::string& err);
+    bool supports_batch_decode() const override { return true; }
+    bool run_batch_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
+                         std::string& err) override {
+        return run_slots(S, tokens, pos, pool, user, out, err);
+    }
+    bool run_batch_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
+                             void* user, int32_t* out, std::string& err) override {
+        return run_slot_rows(rows, S, tokens, pos, pool, user, out, err);
+    }
+    bool commit_batch_slots(std::string& err) override { return commit_slots(err); }
+    bool commit_batch_slot_prefixes(const int* keep, std::string& err) override { return commit_slot_prefixes(keep, err); }
     /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU). 0 = unbounded.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
 

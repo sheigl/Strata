@@ -2295,11 +2295,7 @@ int64_t Prefill::pipeline_chunk(int64_t n, int64_t cap, int stages, double ratio
     }
     return (best < today && 100 * best_cost < 97 * today_cost) ? best : cap;
 }
-int Prefill::stage_count() const {
-    int stages = 1;
-    for (const Prefill* p = next_; p != nullptr; p = p->next_) ++stages;
-    return stages;
-}
+int Prefill::stage_count() const { return 1 + (next_ != nullptr ? next_->stage_count() : 0); }
 int64_t Prefill::plan_chunk(int64_t n) const {
     const double pipe = pipe_value();
     const int stages = stage_count();
@@ -2319,9 +2315,27 @@ void Prefill::log_plan(int64_t n, int64_t chunk, int stages) {
                             : "1: today's chunk count, evened out");
 }
 int64_t Prefill::chain_experts_streamed() const {
-    int64_t sum = 0;
-    for (const Prefill* p = this; p != nullptr; p = p->next_) sum += p->stats_.experts_streamed;
-    return sum;
+    return stats_.experts_streamed + (next_ != nullptr ? next_->chain_experts_streamed() : 0);
+}
+
+void Prefill::log_mmq_direct_totals() const {
+    std::fprintf(stderr, "strata prefill: layers %lld..%lld: %lld of %lld resident experts read in place, %lld "
+                         "streamed (STRATA_MMQ_DIRECT, totals)\n", (long long) stage_lb_, (long long) stage_le_,
+                 (long long) stats_.experts_direct, (long long) stats_.experts_resident,
+                 (long long) stats_.experts_streamed);
+    if (next_ != nullptr) next_->log_mmq_direct_totals();
+}
+
+bool Prefill::run_chunk(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    return run_impl(tokens, n, pos0, err);
+}
+
+void Prefill::set_handoff(const void* rows, const void* event, int pieces, bool single_chunk, bool pipe_chunked) {
+    hand_in_ = static_cast<const float*>(rows);
+    hand_ev_ = event;
+    hand_pieces_ = pieces;
+    single_chunk_ = single_chunk;
+    pipe_chunked_ = pipe_chunked;
 }
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
@@ -4920,22 +4934,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_err_.clear();
-            next_->hand_in_ = h;
-            next_->hand_ev_ = hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr;
-            next_->hand_pieces_ = hp;
-            next_->single_chunk_ = single_chunk;
-            next_->pipe_chunked_ = pipe_chunked;
+            next_->set_handoff(h, hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr, hp, single_chunk,
+                               pipe_chunked);
             if (handoff_pipe_worker()) {
                 if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
                 next_run_ = m.hand_worker->submit(std::packaged_task<bool()>([this, tokens, c0, T, p0] {
-                    const bool r = next_->run_impl(tokens + c0, T, p0, next_err_);
+                    const bool r = next_->run_chunk(tokens + c0, T, p0, next_err_);
                     (void) cudaGetLastError();   // clear what a thread's end cleared (std::async)
                     return r;
                 }));
             } else
             next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
                 strata::aux_cpus::pin_current_thread();
-                return next_->run_impl(tokens + c0, T, p0, next_err_);
+                return next_->run_chunk(tokens + c0, T, p0, next_err_);
             });
             hand_buf_ ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
@@ -5153,11 +5164,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     // resident experts its prompt MMQ read in their slots, of all its resident and streamed ones
     if (mmq::direct_mode() == 1) {
         static const bool log = [] { const char* v = std::getenv("STRATA_MMQ_DIRECT_LOG"); return v && std::atoi(v) != 0; }();
-        for (const Prefill* p = this; log && p != nullptr; p = p->next_)
-            std::fprintf(stderr, "strata prefill: layers %lld..%lld: %lld of %lld resident experts read in place, %lld "
-                                 "streamed (STRATA_MMQ_DIRECT, totals)\n", (long long) p->stage_lb_,
-                         (long long) p->stage_le_, (long long) p->stats_.experts_direct,
-                         (long long) p->stats_.experts_resident, (long long) p->stats_.experts_streamed);
+        if (log) log_mmq_direct_totals();
     }
     return true;
 }

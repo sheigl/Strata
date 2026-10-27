@@ -250,6 +250,17 @@ if(STRATA_WERROR)
     $<$<COMPILE_LANGUAGE:HIP>:-Werror>)
 endif()
 
+# ---- strata_rpc ------------------------------------------------------------
+# Backend-neutral framing used by the CUDA and SYCL engine processes. It is deliberately independent of the GPU
+# backends so its tests can run in a CPU-only configuration.
+if (WIN32)
+  add_library(strata_rpc STATIC src/rpc/protocol.cpp src/rpc/control.cpp src/rpc/local_transport_stub.cpp)
+else()
+  add_library(strata_rpc STATIC src/rpc/protocol.cpp src/rpc/control.cpp src/rpc/local_transport_posix.cpp)
+endif()
+target_include_directories(strata_rpc PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_rpc PRIVATE strata_warnings)
+
 # ---- strata_artifact -------------------------------------------------------
 # Header-only, and that is a deliberate property rather than an unfinished split: the GGUF reader and the
 # scalar dequantizers hold no state worth hiding, and a header-only boundary cannot introduce a
@@ -303,6 +314,18 @@ if(STRATA_BUILD_TESTS)
   add_executable(split_rules_test tests/program/split_rules_test.cpp)
   target_include_directories(split_rules_test PRIVATE include)
   add_test(NAME split_rules_test COMMAND split_rules_test)
+  add_executable(rpc_protocol_test tests/rpc/protocol_test.cpp)
+  target_link_libraries(rpc_protocol_test PRIVATE strata_rpc)
+  add_test(NAME rpc_protocol_test COMMAND rpc_protocol_test)
+  add_executable(rpc_local_transport_test tests/rpc/transport_test.cpp)
+  target_link_libraries(rpc_local_transport_test PRIVATE strata_rpc)
+  add_test(NAME rpc_local_transport_test COMMAND rpc_local_transport_test)
+  add_executable(rpc_control_test tests/rpc/control_test.cpp)
+  target_link_libraries(rpc_control_test PRIVATE strata_rpc)
+  add_test(NAME rpc_control_test COMMAND rpc_control_test)
+  add_executable(rpc_decode_split_test tests/rpc/decode_split_test.cpp src/program/rpc_worker.cpp)
+  target_link_libraries(rpc_decode_split_test PRIVATE strata_rpc)
+  add_test(NAME rpc_decode_split_test COMMAND rpc_decode_split_test)
 
   # the prompt planner's host-memory model (#2824): header-only, no GPU
   add_executable(prefill_plan_test tests/program/prefill_plan_test.cpp)
@@ -313,6 +336,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE include)
   add_test(NAME share_rules_test COMMAND share_rules_test)
+
+  # the prompt chunk boundary between two stages: header-only, no GPU
+  add_executable(prefill_stage_test tests/prefill/prefill_stage_test.cpp)
+  target_include_directories(prefill_stage_test PRIVATE include)
+  add_test(NAME prefill_stage_test COMMAND prefill_stage_test)
 
   # the Windows HIP auto prefill chunk cap (#1630) and the commit-limit verdict (#1607): header-only, no GPU
   add_executable(host_limits_test tests/platform/host_limits_test.cpp)
@@ -756,10 +784,36 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(dflash2_attn_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(dflash2_attn_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
 
-  add_executable(strata src/program/generate.cpp)
+  # The per-stage ownership/routing unit (the same stage ranges the RPC prefix worker will use).  It is a separate
+  # object so CUDA and HIP compilation can be checked before the full driver executable links.
+  add_library(strata_stage_runtime OBJECT src/program/stage_runtime.cpp)
+  target_include_directories(strata_stage_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                             ${_strata_gpu_include_directories})
+  target_link_libraries(strata_stage_runtime PRIVATE ${_strata_gpu_runtime_target})
+  target_compile_definitions(strata_stage_runtime PRIVATE
+    $<$<BOOL:${STRATA_EXPERIMENTAL_SM60}>:STRATA_EXPERIMENTAL_SM60=1>
+    STRATA_HAVE_DFLASH2=1
+    $<$<BOOL:${STRATA_NATIVE_EXPERTS}>:STRATA_NATIVE_EXPERTS=1>
+    $<$<BOOL:${STRATA_PREFILL_MMQ}>:STRATA_PREFILL_MMQ=1>
+    $<$<BOOL:${STRATA_PREFILL_MMQ}>:STRATA_PREFILL_FUSED=1>
+    $<$<BOOL:${STRATA_Q6K_EXPERTS}>:STRATA_Q6K_EXPERTS=1>)
+
+  add_executable(strata src/program/generate.cpp src/program/rpc_worker.cpp src/program/rpc_prefix_stage.cpp
+                 $<TARGET_OBJECTS:strata_stage_runtime>)
+  add_executable(stage_runtime_test tests/program/stage_runtime_test.cpp)
+  target_include_directories(stage_runtime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                             ${_strata_gpu_include_directories})
+  target_compile_definitions(stage_runtime_test PRIVATE
+    $<$<BOOL:${STRATA_EXPERIMENTAL_SM60}>:STRATA_EXPERIMENTAL_SM60=1>
+    STRATA_HAVE_DFLASH2=1
+    $<$<BOOL:${STRATA_NATIVE_EXPERTS}>:STRATA_NATIVE_EXPERTS=1>
+    $<$<BOOL:${STRATA_PREFILL_MMQ}>:STRATA_PREFILL_MMQ=1>
+    $<$<BOOL:${STRATA_PREFILL_MMQ}>:STRATA_PREFILL_FUSED=1>
+    $<$<BOOL:${STRATA_Q6K_EXPERTS}>:STRATA_Q6K_EXPERTS=1>)
+  add_test(NAME stage_runtime_test COMMAND stage_runtime_test)
   strata_utf8_manifest(strata)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec strata_rpc ${_strata_gpu_runtime_target})
   if(WIN32 AND STRATA_ENABLE_HIP)
     # 0.2.1.2: the ROCm math libraries live in <package>\rocm\bin, which is on PATH only when the launcher starts the engine; load them on first
     # use (main() adds that folder to the DLL search first) so `strata.exe --version` works from the package folder.  amdhip64_7.dll and the
@@ -792,6 +846,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata-q36 PRIVATE strata_qwen35 ${_strata_gpu_runtime_target})
   target_link_libraries(strata PRIVATE strata_qwen35)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_QWEN35=1)
+  target_compile_definitions(strata_stage_runtime PRIVATE STRATA_HAVE_QWEN35=1)
+  target_compile_definitions(stage_runtime_test PRIVATE STRATA_HAVE_QWEN35=1)
   endif()
 
   # DeepSeek-V4.1-Flash: the third engine path (src/dsv41, from Project Maya's maya-ds4, MIT, third_party/project-maya).
@@ -1571,6 +1627,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(split_ring_test src/program/split_ring_test.cpp)
   target_include_directories(split_ring_test PRIVATE include)
   add_test(NAME split_ring_test COMMAND split_ring_test)
+  # the narrow run/commit boundary shared by a local Verifier chain and a future remote stage (header-only, CPU)
+  add_executable(stage_chain_test tests/core/stage_chain_test.cpp)
+  target_include_directories(stage_chain_test PRIVATE include)
+  add_test(NAME stage_chain_test COMMAND stage_chain_test)
   # the serve loop's conversation-cache retention policy (header-only, no library to link)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)

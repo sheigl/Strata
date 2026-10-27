@@ -11,7 +11,9 @@ Strata as one of its models. It needs a [source checkout](SOURCE_INSTALL.md), no
    so call `serve/server.py` with llama-swap's port instead:
 
 ```yaml
-healthCheckTimeout: 300            # model loading takes minutes; give it room
+healthCheckTimeout: 900            # model loading takes minutes; give it room
+
+unloadTimeout: 45                  # longer than any --shutdown-timeout you add below
 
 models:
   strata:
@@ -31,8 +33,53 @@ models:
 - `exec` makes the Python server the process llama-swap stops. On SIGTERM the server stops its engine and the
   GPU memory is freed.
 - `checkEndpoint: /health` works because Strata's `/health` answers only once the model is loaded.
+- `ttl` is llama-swap's, not Strata's: `ttl: 1800` keeps the model loaded for half an hour after the last request,
+  and `ttl: 0` never unloads it. Without a `ttl` the model follows `globalTTL`, which is 0 (never) by default.
+- `unloadTimeout` (10 s by default) must outlast Strata's shutdown, or llama-swap kills the server before it has
+  finished. Called as `serve/server.py` in the entry above, Strata stops at once and cancels whatever was running.
+  Add `--shutdown-timeout 30` to the command to let a request in flight finish first, and then keep llama-swap's
+  `unloadTimeout` above those 30 s. `strata serve` does this already: its own default is 30, and it never exceeds 300.
 - Strata needs the card's memory to itself. If other models share the GPU, put them in a llama-swap group or let
   swapping unload them.
+
+## A model shows STOPPED after an answer
+
+The model log then ends like this:
+
+```text
+[strata] done: 2079 tokens in 41 s (52.2 tok/s) (stop, cancel=False)
+
+[strata] stopping (Ctrl+C again to end the engine at once) ...
+[strata] stopped
+```
+
+Nothing failed there. `(stop, cancel=False)` says the answer finished by itself, not by a token limit and not by a
+cancel. The two lines after it are Strata shutting down cleanly because llama-swap asked it to: Strata stops the
+engine, frees the card's memory and exits, and llama-swap then lists the model as STOPPED. Strata never stops its own
+server for being idle; its own idle setting unloads the model and keeps serving, without the server going away.
+
+llama-swap unloads a model in four cases. The first two are the ones people hit:
+
+| Why llama-swap unloaded it | Where to look |
+| --- | --- |
+| Its `ttl` ran out | `ttl` on the entry, or `globalTTL`. Use `ttl: 0` to never unload. |
+| Another model was requested and swapped it out | `routing.router.settings.groups`: the defaults keep one model loaded at a time. |
+| Somebody stopped it in llama-swap's own page | nothing to change; start it again when needed. |
+| The load took longer than llama-swap waits | `healthCheckTimeout`, 120 s by default. A large model on a spinning disk can take minutes, and Strata opens its port only once the model is loaded, so raise it (`900` is in the example above). It is a top-level setting only: one written inside a model entry is ignored. |
+
+An unloaded model is loaded again by the next request, which costs the whole load time. To keep it warm, set
+`ttl: 0` and load it with llama-swap at startup:
+
+```yaml
+hooks:
+  on_startup:
+    preload:
+      - strata
+```
+
+If a client that asks for the whole answer at once (no streaming) gives up on a long prompt, it is llama-swap's
+`timeouts.responseHeader`: Strata sends the response headers only when it has read the prompt, and reading a long
+prompt takes minutes. Leave that timeout at 0 (no limit) or set it well above the read time.
 
 ## Host is not allowed
 

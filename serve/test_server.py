@@ -24,7 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (ANSWER_RESERVE_MIN, CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
                           PP_DONE_TAIL, Service,
-                          StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
+                          StrataEngine, api_key_of, apply_rpc_split_config, engine_args, key_matches, layer_split_value,
+                          prompt_progress,
                           prompt_tokens_seen,
                           request_stats, request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
@@ -2672,6 +2673,38 @@ class LayerSplit(unittest.TestCase):
     def test_one_gpu_ignores_it(self):
         self.assertEqual(engine_args({"args": ["--native", "x"], "gpu": [0], "layer_split": "24,16"}),
                          ["--native", "x"])
+
+
+class RpcSplitConfig(unittest.TestCase):
+    """The opt-in RPC gate is checked before the engine starts; absent config changes nothing."""
+
+    def cfg(self):
+        return {
+            "backend": "cuda", "exe": "component:strata-engine", "gpu": 0,
+            "args": ["--model", "qwen.gguf"],
+            "rpc_split": {"boundary": 24, "workers": [{"id": "arc", "backend": "sycl", "device": 0}]},
+        }
+
+    def test_absent_leaves_the_normal_config(self):
+        c = self.cfg()
+        c.pop("rpc_split")
+        self.assertIsNone(apply_rpc_split_config(c))
+
+    def test_valid_one_worker_split_is_reported(self):
+        plan = apply_rpc_split_config(self.cfg())
+        self.assertEqual(plan["boundary"], 24)
+        self.assertEqual(plan["worker"]["backend"], "sycl")
+
+    def test_unsupported_combinations_are_refused(self):
+        for change, why in (({"layer_split": "24"}, "layer_split"),
+                            ({"args": ["--peer-device", "1"]}, "--peer-device"),
+                            ({"parallel": 2}, "parallel"),
+                            ({"vision": {"exe": "encoder"}}, "vision")):
+            with self.subTest(change=change):
+                c = {**self.cfg(), **change}
+                with self.assertRaises(ValueError) as e:
+                    apply_rpc_split_config(c)
+                self.assertIn(why, str(e.exception))
 
 
 class DraftHeadHint(unittest.TestCase):
