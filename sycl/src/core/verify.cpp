@@ -475,6 +475,7 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     g_ = &g;
     ss_ = &ss;
     hits_ = hits;
+    mirror_covers_loan_ = hits.mirror_covers_loan;
     head_ = head;
     max_t_ = max_t;
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
@@ -1739,7 +1740,10 @@ void Verifier::refresh_ar() {
     const int64_t n = (le_ < 0 ? g_->n_layers : le_) * ne - lb_ * ne;
     int32_t lo = 0;
     for (int64_t i = 0; i < n; ++i) lo = std::min(lo, r[i]);
-    const bool off = lo < 0;
+    // STRATA_SPLIT_LEND_MIRROR: a -1 whose blob is in this stage's mirror is not a miss the window has to doorbell
+    // for - the zero-doorbell graph's plan reads the mirror address instead (resident_plan_mirror).  Only when every
+    // expert a loan can take is mirrored, which the loan setup establishes before it lends anything.
+    const bool off = lo < 0 && !mirror_covers_loan_;
     if (off != ar_off_) {
         ar_off_ = off;
         std::fprintf(stderr, "strata verify: layers [%lld, %lld) %s\n", (long long) lb_, (long long) (le_ < 0 ? g_->n_layers : le_),

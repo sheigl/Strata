@@ -595,6 +595,46 @@ without an error at a steady 435 tok/s and with no change in VRAM.
 Not done: the hand-off of a batch window between stages (`§7f` of the parallelization report, one flag a group) is not part of
 this; it can emit a wrong token from time to time and is listed for later.
 
+## A loan's misses from the pinned mirror (SYCL, opt-in)
+
+With `--batch`, a prompt read borrows the tail of each stage's expert cache for its buffers. While those slots are lent,
+the verifier moves that stage's windows off the zero-doorbell graph to the doorbell graph, which asks the CPU pool for the
+experts the cache no longer holds: the decoding slots then crawl for the whole read (measured at 0.1-0.4 tok/s on the
+five Arc cards below). The borrowed experts' blobs can be kept in the pinned host mirror instead, and the zero-doorbell
+graph's plan already reads a mirror address for an expert with no slot, so the windows can stay on the fast graph and read
+them over PCIe.
+
+Two switches, both required together:
+
+| Switch | What it does |
+|---|---|
+| `STRATA_SPLIT_LEND_MIRROR=1` | mirror every expert a prompt loan can take (needs `STRATA_SPLIT_MIRROR=1`, `--stream-experts` and `--batch`) |
+| `STRATA_BATCH_LOAN_CHUNK=N` | a read beside decoding slots borrows N tokens' buffers instead of the `--prefill` chunk; a solo read is unchanged |
+
+Without the second the mirror is the whole loan's tail (17.35 GiB on the rig below, which pushed the host into swap).
+With `N=2048` it is 6.13 GiB added (9.08 GiB total) and the verifier keeps the zero-doorbell graph; the engine prints
+`the loan's misses are all mirrored (fast graph keeps the windows)`.
+
+Measured on B65 + 3x B580 + B70, Qwen3.8-Flash-Next UD-Q4_K_XL, `parallel 4`, `--vram-reserve-mib 512`,
+`--kv-resident 0`, `--prefill 8192`, `STRATA_BATCH_DECODE_SHARE=2.0`, `STRATA_BATCH_LOAN_CHUNK=2048`:
+
+| | without the mirror | with it |
+|---|---:|---:|
+| tokens three streams received during a 35K read | 132 | **4,163** |
+| longest pause of a stream | 82.6 s | **18.0 s** |
+| CPU expert misses per layer-window | ~0.1 | 0.07-0.14 |
+| that 35K read beside them | 318 s | 339 s |
+| solo read, 39K tokens | 333 tok/s | 309 tok/s |
+| pinned RAM | - | 6.13 GiB added (9.08 GiB total) |
+
+A 400-token answer beside a 39K read decoded at **20.4 tok/s** against 50 tok/s alone, and was token-identical to the
+same answer warmed alone (`--prompt-cache 0`; the first request of a fresh engine differs from both, with or without the
+mirror). A needle at 94,026 tokens, depths 10/50/90, was found 3 of 3.
+
+Not measured: other backends, cards other than B-series, more than four slots, loans other than 2048, or a solo read
+beside no other request on a cold page cache. The mirror is pinned RAM for the life of the engine; check free memory
+before enabling it on a smaller machine.
+
 ## Exactness
 
 A batch row's arithmetic is the single-token window's, so with greedy decoding **every conversation of a batch

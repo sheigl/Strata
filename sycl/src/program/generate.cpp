@@ -5098,6 +5098,14 @@ int main(int argc, char **argv) try {
     unsigned long long* mirror_table_d = nullptr;   // [n_layers][n_expert] device-readable mirror addresses (0 = none)
     uint64_t mirror_cap_bytes = 0;                  // the budget the mirror was built against (STRATA_MIRROR_ADAPT adopts against it)
     int64_t unmirrored_misses = 0;
+    // STRATA_BATCH_LOAN_CHUNK=N (opt-in): while a batch slot is decoding, the prompt lends (and reads) at most N
+    // tokens' buffers, so the set of experts a loan can take is small enough to mirror (STRATA_SPLIT_LEND_MIRROR).
+    // A solo read still uses the configured --prefill chunk: no window runs beside it, so its speed is untouched.
+    static const int64_t batch_loan_chunk = [] {
+        const char* v = std::getenv("STRATA_BATCH_LOAN_CHUNK");
+        return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : (int64_t) 0;
+    }();
+    bool lend_mirror_complete = false;   // every expert a batch loan can take is in the stage mirror
     // STRATA_SPLIT_MIRROR (opt-in, default off): on a multi-GPU layer split, defer the mirror build to after the
     // stage caches exist and give EVERY stage its own mirror (below, after the stage loop) instead of the
     // first-stage-only mirror here.  Off (or single-GPU): this block runs exactly as it always has.
@@ -7427,6 +7435,137 @@ int main(int argc, char **argv) try {
                 }
             }
         }
+        // STRATA_SPLIT_LEND_MIRROR=1 (opt-in): the stage mirror normally contains only experts that missed
+        // residency at startup.  A prompt loan makes additional, formerly resident tail slots nonresident while
+        // its chunks are read; the device resident planner already falls back to a stage's pinned-host mirror for
+        // such entries.  Mirror the loan candidates once so batch windows can read those experts over PCIe instead
+        // of computing them on the CPU.  The normal single refill after the whole prompt remains; there is no
+        // multi-GiB refill/re-lend cycle at every chunk boundary.
+        static const bool split_lend_mirror_on = [] {
+            const char* v = std::getenv("STRATA_SPLIT_LEND_MIRROR");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        if (split_lend_mirror_on) {
+            if (!defer_mirror || !o.stream_experts || srcp != &gguf_src || o.batch <= 0 || pf_parts.empty() ||
+                batch_loan_chunk <= 0) {
+                std::fprintf(stderr, "strata serve: STRATA_SPLIT_LEND_MIRROR is off: it needs a layer split, "
+                                     "--batch, --stream-experts, STRATA_SPLIT_MIRROR=1 and STRATA_BATCH_LOAN_CHUNK=N\n");
+            } else {
+                const int n_mirror_stages = (int) split_at.size() + 1;
+                std::vector<std::vector<std::pair<int64_t, int64_t>>> by_stage((size_t) n_mirror_stages);
+                std::vector<uint8_t> seen((size_t) (g.n_layers * g.n_expert), 0);
+                for (size_t pi = 0; pi < pf_parts.size(); ++pi) {
+                    const PfPart& p = pf_parts[pi];
+                    if (p.first < 0) continue;
+                    // the tail a STRATA_BATCH_LOAN_CHUNK-sized loan can take (a subset of p.first's tail when the
+                    // concurrent chunk is smaller than --prefill); without the knob there is nothing to bound
+                    const int64_t bound = batch_loan_chunk > 0
+                        ? std::max<int64_t>(p.first, p.cache->slots() - part_slots(p, batch_loan_chunk)) : p.first;
+                    const auto& ranked = pi == 0 ? profile : stages[pi - 1]->profile;
+                    auto add = [&](int64_t l, int64_t ex) {
+                        if (l < p.lb || l >= p.le || ex < 0 || ex >= g.n_expert) return;
+                        const int32_t slot = p.cache->slot_of(l, ex);
+                        if (slot < bound) return;
+                        const size_t at = (size_t) (l * g.n_expert + ex);
+                        if (seen[at]) return;
+                        seen[at] = 1;
+                        if (!gguf_src.pinned(l, ex)) by_stage[pi].push_back({l, ex});
+                    };
+                    for (const auto& [l, ex] : ranked) add(l, ex);  // hottest borrowed experts first
+                    for (int64_t l = p.lb; l < p.le; ++l)
+                        for (int64_t ex = 0; ex < g.n_expert; ++ex) add(l, ex);  // unprofiled pairs
+                }
+                // Interleave stages by rank so a capped mirror covers each card instead of spending its whole
+                // budget on the first stage in the split.
+                std::vector<std::pair<int64_t, int64_t>> candidates;
+                for (size_t rank = 0;; ++rank) {
+                    bool more = false;
+                    for (const auto& v : by_stage) {
+                        if (rank < v.size()) {
+                            candidates.push_back(v[rank]);
+                            more = true;
+                        }
+                    }
+                    if (!more) break;
+                }
+                uint64_t need_bytes = 0;
+                const auto& layout = strata::kernels::cpu::expert_layout();
+                for (const auto& [l, ex] : candidates) {
+                    (void) ex;
+                    need_bytes += ((uint64_t) layout.bytes[(size_t) l] + 255) & ~255ull;
+                }
+                const uint64_t before_bytes = gguf_src.mirrored_bytes();
+                const uint64_t budget = mirror_cap_bytes > before_bytes ? mirror_cap_bytes - before_bytes : 0;
+                if (candidates.empty()) {
+                    std::fprintf(stderr, "strata serve: STRATA_SPLIT_LEND_MIRROR: no resident prompt-loan slots to mirror\n");
+                } else if (budget == 0) {
+                    std::fprintf(stderr, "strata serve: STRATA_SPLIT_LEND_MIRROR: no mirror budget remains; "
+                                         "the ordinary prompt loan is unchanged\n");
+                } else {
+                    std::string mirror_err;
+                    const int64_t got = gguf_src.mirror(candidates, budget, 8, mirror_err);
+                    if (got < 0) {
+                        std::fprintf(stderr, "strata serve: STRATA_SPLIT_LEND_MIRROR: mirror failed (%s); "
+                                             "the ordinary prompt loan is unchanged\n", mirror_err.c_str());
+                    } else if (got > 0) {
+                        stage_mirror.resize((size_t) n_mirror_stages, nullptr);
+                        bool table_ok = true;
+                        for (int s = 0; s < n_mirror_stages; ++s) {
+                            const int64_t lb = s == 0 ? 0 : stages[(size_t) s - 1]->lb;
+                            const int64_t le = s == 0 ? split_at[0] : stages[(size_t) s - 1]->le;
+                            const int dev = s == 0 ? 0 : stages[(size_t) s - 1]->dev;
+                            std::vector<unsigned long long> tab((size_t) (g.n_layers * g.n_expert), 0ull);
+                            for (int64_t l = lb; l < le; ++l)
+                                for (int64_t ex = 0; ex < g.n_expert; ++ex)
+                                    if (gguf_src.pinned(l, ex))
+                                        tab[(size_t) (l * g.n_expert + ex)] =
+                                            (unsigned long long) gguf_src.device_alias(l, ex);
+                            const strata::core::OnDevice on(dev);
+                            if (stage_mirror[(size_t) s] == nullptr) {
+                                try {
+                                    stage_mirror[(size_t) s] = sycl::malloc_device<unsigned long long>(
+                                        tab.size(), dpct::get_in_order_queue());
+                                } catch (const sycl::exception& ex) {
+                                    std::fprintf(stderr, "strata serve: STRATA_SPLIT_LEND_MIRROR: stage %d table "
+                                                         "allocation failed: %s\n", s, ex.what());
+                                }
+                            }
+                            if (stage_mirror[(size_t) s] == nullptr) {
+                                table_ok = false;
+                                break;
+                            }
+                            dpct::get_in_order_queue().memcpy(stage_mirror[(size_t) s], tab.data(),
+                                                              tab.size() * sizeof(unsigned long long)).wait();
+                        }
+                        if (!table_ok) {
+                            std::fprintf(stderr, "strata serve: STRATA_SPLIT_LEND_MIRROR: could not publish every "
+                                                 "stage table; stopping rather than run with a partial table\n");
+                            return 1;
+                        }
+                        mirror_table_d = stage_mirror[0];
+                        // What the verifier needs to know: every expert a concurrent loan can take has a mirror
+                        // address.  Then its zero-doorbell graph serves them over PCIe and the loan does not force
+                        // the slower doorbell graph on the decoding slots.
+                        lend_mirror_complete = !candidates.empty();
+                        for (const auto& [l, ex] : candidates)
+                            if (!gguf_src.pinned(l, ex)) { lend_mirror_complete = false; break; }
+                        const uint64_t added = gguf_src.mirrored_bytes() - before_bytes;
+                        std::fprintf(stderr, "strata serve: STRATA_SPLIT_LEND_MIRROR: mirrored %lld of %zu loan "
+                                             "candidates (%.2f GiB added; %.2f GiB requested; %.2f GiB total); "
+                                             "the loan's misses are %s\n",
+                                     (long long) got, candidates.size(), (double) added / 1073741824.0,
+                                     (double) need_bytes / 1073741824.0,
+                                     (double) gguf_src.mirrored_bytes() / 1073741824.0,
+                                     lend_mirror_complete ? "all mirrored (fast graph keeps the windows)"
+                                                          : "NOT all mirrored (the doorbell graph runs them)");
+                    } else {
+                        std::fprintf(stderr, "strata serve: STRATA_SPLIT_LEND_MIRROR: mirror budget covers none of "
+                                             "%zu loan candidates (%.2f GiB requested); the ordinary prompt loan is unchanged\n",
+                                     candidates.size(), (double) need_bytes / 1073741824.0);
+                    }
+                }
+            }
+        }
         kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
         // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for
@@ -7448,6 +7587,7 @@ int main(int argc, char **argv) try {
         strata::core::VerifyHits vh;
         int32_t* usage_dev_srv = nullptr;
         vh.d_res = thits.d_res;
+        vh.mirror_covers_loan = lend_mirror_complete;
         // 0.1.44 --expert-profile-save under STRATA_VERIFY_NO_HOST (no adaptive tier, so no host-side counts): the device
         // plan counts every routed expert of the verify windows and the saved profile is ranked from those counts.
         if (mirror_table_d && !o.expert_profile_save.empty()) {
@@ -7558,6 +7698,7 @@ int main(int argc, char **argv) try {
                     const strata::core::OnDevice on(gs.dev);
                     strata::core::VerifyHits vs;
                     vs.d_res = gs.d_res;
+                    vs.mirror_covers_loan = lend_mirror_complete;
                     vs.mirror_table = defer_mirror && (size_t) st < stage_mirror.size() ? stage_mirror[(size_t) st] : nullptr;
                     vs.h_res = host_res.empty() ? nullptr : host_res.data();
                     vs.cache_base = gs.cache.device_slot(0);
@@ -7613,6 +7754,7 @@ int main(int argc, char **argv) try {
                 const strata::core::OnDevice on(gs.dev);
                 strata::core::VerifyHits vs;
                 vs.d_res = gs.d_res;
+                vs.mirror_covers_loan = lend_mirror_complete;
                 vs.mirror_table = defer_mirror && stage_mirror.size() > 1 ? stage_mirror[1] : nullptr;   // this card's own
                 vs.h_res = host_res.empty() ? nullptr : host_res.data();
                 vs.cache_base = gs.cache.device_slot(0);
@@ -10935,10 +11077,21 @@ int main(int argc, char **argv) try {
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
-                if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                // #656/#1504, the rule the CUDA engine's batch_read_piece follows: with no slot decoding a layer split
+                // reads in pieces of STRATA_BATCH_YIELD_CHUNKS chunks (0, the default: one run, as before), so a
+                // waiting shorter request can take over at a piece's end instead of after the whole prompt.  A read
+                // beside decoding slots keeps one chunk a piece.  One GPU, or no --batch: one run, unchanged.
+                static const int64_t yield_chunks = [] {
+                    const char* v = std::getenv("STRATA_BATCH_YIELD_CHUNKS");
+                    return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 0;
+                }();
+                const bool beside = batch_on();
+                if (o.batch <= 0 || piped || (!beside && (stages.empty() || yield_chunks <= 0)))
+                    return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
+                const int64_t piece = beside ? C : C * yield_chunks;
                 for (int64_t q = a0; q < b0;) {
-                    const int64_t r = std::min(b0, q + C);
+                    const int64_t r = std::min(b0, q + piece);
                     const auto tq = Clock::now();
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
                     q = r;
@@ -11089,7 +11242,15 @@ int main(int argc, char **argv) try {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
-                if (!win && !lend(to - at, err)) {
+                if (!win && batch_loan_chunk > 0 && batch_on()) {
+                    // A concurrent read borrows only the smaller loan, so the mirror can hold every slot it may take.
+                    // The prefill object's chunk follows the relayout, so the read runs in that many-token chunks too.
+                    const int64_t want = std::min<int64_t>(to - at, batch_loan_chunk);
+                    if (!lend(want, err)) {
+                        std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
+                        return 1;
+                    }
+                } else if (!win && !lend(to - at, err)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
                 }
@@ -12960,6 +13121,7 @@ int main(int argc, char **argv) try {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
+        vh.mirror_covers_loan = lend_mirror_complete;
         int32_t* usage_dev = nullptr;   // STRATA_USAGE_DUMP=PATH: the device plan counts every routed expert (measurement)
         const char* usage_dump = std::getenv("STRATA_USAGE_DUMP");
         if (mirror_table_d && usage_dump && *usage_dump) {

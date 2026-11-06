@@ -59,6 +59,9 @@ struct VerifyHits {
     /// addresses on THIS stage's device context, 0 = none), indexed by global layer against `d_res`.  Null: the
     /// legacy global set by resident_plan_set_mirror applies (the single-card / first-stage-only path).
     const unsigned long long* mirror_table = nullptr;
+    /// Every expert a prompt loan can make nonresident is in that mirror (STRATA_SPLIT_LEND_MIRROR): the zero-doorbell
+    /// graph may then serve them over PCIe, so a loan no longer forces this stage's windows onto the doorbell graph.
+    bool mirror_covers_loan = false;
 };
 
 class Verifier {
@@ -347,6 +350,7 @@ private:
     /// was all-resident.  refresh_ar() looks at the host table before each window.
     bool ar_off_ = false;
     bool ar_on() const { return all_resident_ && !ar_off_; }
+    bool mirror_covers_loan_ = false;   ///< VerifyHits::mirror_covers_loan (a loan's misses are all mirrored)
     void refresh_ar();
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
