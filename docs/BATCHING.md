@@ -613,7 +613,9 @@ Two switches, both required together:
 
 Without the second the mirror is the whole loan's tail (17.35 GiB on the rig below, which pushed the host into swap).
 With `N=2048` it is 6.13 GiB added (9.08 GiB total) and the verifier keeps the zero-doorbell graph; the engine prints
-`the loan's misses are all mirrored (fast graph keeps the windows)`.
+`the loan's misses are all mirrored (fast graph keeps the windows)`. The choice is made per window against the actual
+mirrored set: a larger loan that the mirror does not cover (a solo read that starts before any slot decodes) falls back
+to the doorbell graph, as it did before, instead of entering the fast graph with an unmirrored miss.
 
 Measured on B65 + 3x B580 + B70, Qwen3.8-Flash-Next UD-Q4_K_XL, `parallel 4`, `--vram-reserve-mib 512`,
 `--kv-resident 0`, `--prefill 8192`, `STRATA_BATCH_DECODE_SHARE=2.0`, `STRATA_BATCH_LOAN_CHUNK=2048`:

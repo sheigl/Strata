@@ -5106,6 +5106,7 @@ int main(int argc, char **argv) try {
         return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : (int64_t) 0;
     }();
     bool lend_mirror_complete = false;   // every expert a batch loan can take is in the stage mirror
+    std::vector<uint8_t> lend_mirror_host;   // [n_layers * n_expert], 1 = the blob is in the pinned mirror
     // STRATA_SPLIT_MIRROR (opt-in, default off): on a multi-GPU layer split, defer the mirror build to after the
     // stage caches exist and give EVERY stage its own mirror (below, after the stage loop) instead of the
     // first-stage-only mirror here.  Off (or single-GPU): this block runs exactly as it always has.
@@ -7549,6 +7550,13 @@ int main(int argc, char **argv) try {
                         lend_mirror_complete = !candidates.empty();
                         for (const auto& [l, ex] : candidates)
                             if (!gguf_src.pinned(l, ex)) { lend_mirror_complete = false; break; }
+                        // The verifier asks this set per window: a loan larger than the mirrored tail must fall back
+                        // to the doorbell graph, because the zero-doorbell graph cannot run an unmirrored miss.
+                        lend_mirror_host.assign((size_t) (g.n_layers * g.n_expert), 0);
+                        for (int64_t l = 0; l < g.n_layers; ++l)
+                            for (int64_t ex = 0; ex < g.n_expert; ++ex)
+                                if (gguf_src.pinned(l, ex))
+                                    lend_mirror_host[(size_t) (l * g.n_expert + ex)] = 1;
                         const uint64_t added = gguf_src.mirrored_bytes() - before_bytes;
                         std::fprintf(stderr, "strata serve: STRATA_SPLIT_LEND_MIRROR: mirrored %lld of %zu loan "
                                              "candidates (%.2f GiB added; %.2f GiB requested; %.2f GiB total); "
@@ -7588,6 +7596,7 @@ int main(int argc, char **argv) try {
         int32_t* usage_dev_srv = nullptr;
         vh.d_res = thits.d_res;
         vh.mirror_covers_loan = lend_mirror_complete;
+        vh.mirror_host = lend_mirror_host.empty() ? nullptr : lend_mirror_host.data();
         // 0.1.44 --expert-profile-save under STRATA_VERIFY_NO_HOST (no adaptive tier, so no host-side counts): the device
         // plan counts every routed expert of the verify windows and the saved profile is ranked from those counts.
         if (mirror_table_d && !o.expert_profile_save.empty()) {
@@ -7699,6 +7708,7 @@ int main(int argc, char **argv) try {
                     strata::core::VerifyHits vs;
                     vs.d_res = gs.d_res;
                     vs.mirror_covers_loan = lend_mirror_complete;
+                    vs.mirror_host = lend_mirror_host.empty() ? nullptr : lend_mirror_host.data();
                     vs.mirror_table = defer_mirror && (size_t) st < stage_mirror.size() ? stage_mirror[(size_t) st] : nullptr;
                     vs.h_res = host_res.empty() ? nullptr : host_res.data();
                     vs.cache_base = gs.cache.device_slot(0);
@@ -13122,6 +13132,7 @@ int main(int argc, char **argv) try {
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         vh.mirror_covers_loan = lend_mirror_complete;
+        vh.mirror_host = lend_mirror_host.empty() ? nullptr : lend_mirror_host.data();
         int32_t* usage_dev = nullptr;   // STRATA_USAGE_DUMP=PATH: the device plan counts every routed expert (measurement)
         const char* usage_dump = std::getenv("STRATA_USAGE_DUMP");
         if (mirror_table_d && usage_dump && *usage_dump) {

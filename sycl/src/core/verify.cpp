@@ -476,6 +476,7 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     ss_ = &ss;
     hits_ = hits;
     mirror_covers_loan_ = hits.mirror_covers_loan;
+    mirror_host_ = hits.mirror_host;
     head_ = head;
     max_t_ = max_t;
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
@@ -1741,9 +1742,18 @@ void Verifier::refresh_ar() {
     int32_t lo = 0;
     for (int64_t i = 0; i < n; ++i) lo = std::min(lo, r[i]);
     // STRATA_SPLIT_LEND_MIRROR: a -1 whose blob is in this stage's mirror is not a miss the window has to doorbell
-    // for - the zero-doorbell graph's plan reads the mirror address instead (resident_plan_mirror).  Only when every
-    // expert a loan can take is mirrored, which the loan setup establishes before it lends anything.
-    const bool off = lo < 0 && !mirror_covers_loan_;
+    // for - the zero-doorbell graph's plan reads the mirror address instead (resident_plan_mirror).  Ask the actual
+    // mirrored set per window, not a flag from startup: a loan can be larger than the mirrored tail (an 8K read
+    // starts while no slot is decoding), and the all-resident graph has no host fallback for a miss it cannot read.
+    bool off = lo < 0;
+    if (off && mirror_host_ != nullptr) {
+        off = false;
+        for (int64_t i = 0; i < n; ++i) {
+            if (r[i] >= 0) continue;
+            const int64_t gi = lb_ * ne + i;
+            if (mirror_host_[gi] == 0) { off = true; break; }
+        }
+    }
     if (off != ar_off_) {
         ar_off_ = off;
         std::fprintf(stderr, "strata verify: layers [%lld, %lld) %s\n", (long long) lb_, (long long) (le_ < 0 ? g_->n_layers : le_),

@@ -62,6 +62,10 @@ struct VerifyHits {
     /// Every expert a prompt loan can make nonresident is in that mirror (STRATA_SPLIT_LEND_MIRROR): the zero-doorbell
     /// graph may then serve them over PCIe, so a loan no longer forces this stage's windows onto the doorbell graph.
     bool mirror_covers_loan = false;
+    /// Host bitset [n_layers * n_expert], 1 = that expert's blob is in the pinned mirror.  refresh_ar() asks this
+    /// per window: a loan can be larger than the mirrored tail (an 8K solo read while no slot decoded), and the
+    /// zero-doorbell graph has no host fallback for a miss it cannot read.
+    const uint8_t* mirror_host = nullptr;
 };
 
 class Verifier {
@@ -351,6 +355,7 @@ private:
     bool ar_off_ = false;
     bool ar_on() const { return all_resident_ && !ar_off_; }
     bool mirror_covers_loan_ = false;   ///< VerifyHits::mirror_covers_loan (a loan's misses are all mirrored)
+    const uint8_t* mirror_host_ = nullptr;   ///< VerifyHits::mirror_host (per (layer, expert) pinned bit)
     void refresh_ar();
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
